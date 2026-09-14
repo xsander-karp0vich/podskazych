@@ -1,0 +1,24 @@
+# STT-сайдкар: локальное распознавание, ничего не уходит в сеть.
+# Окружение для разработки. Точные версии для установщика — requirements-stt.txt.
+faster-whisper==1.2.1
+# Закреплён: на процессоре кодировщику подаётся окно короче 30 с (engines.py,
+# _transcribe_window). Это не описано в документации — после обновления проверить.
+ctranslate2==4.8.2
+# CUDA-зависимости для CTranslate2 на Windows ставятся колёсами, а не toolkit'ом
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+# cudart64_12.dll — в зависимости faster-whisper не входит,
+# но без него cuBLAS не загружается
+nvidia-cuda-runtime-cu12
+# VAD: режем тишину до инференса
+onnxruntime
+# захват системного звука напрямую через WASAPI:
+# web-путь Chromium (getDisplayMedia + loopback) на Windows не стартует
+PyAudioWPatch
+# потоковый ресемпл С СОСТОЯНИЕМ: scipy считает каждый блок отдельно и рвёт
+# сигнал на склейках — замерено падение чистоты со 142 дБ до 22 дБ
+soxr
+
+# транспорт до Electron
+websockets
+numpy

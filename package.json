@@ -1,0 +1,114 @@
+{
+  "name": "call-copilot",
+  "version": "0.1.0",
+  "description": "Личный ассистент для созвонов и демо: локальный транскрипт и подсказки из встроенной базы вопросов",
+  "main": "out/main/index.js",
+  "private": true,
+  "license": "MIT",
+  "author": "Podskazych contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xsander-karp0vich/podskazych.git"
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"tests/**/*.test.ts\"",
+    "kb:check": "node scripts/kb-check.mjs",
+    "stt:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-stt-runtime.ps1",
+    "dist": "node scripts/kb-check.mjs && npm run stt:runtime -- -SkipIfReady && electron-vite build && electron-builder --win"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.263",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "electron": "^44.2.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^7.3.6"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "undici": "^8.10.2"
+  },
+  "productName": "Подсказыч",
+  "build": {
+    "appId": "tech.local.callcopilot",
+    "productName": "Подсказыч",
+    "executableName": "Podskazych",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "sidecar",
+        "to": "sidecar",
+        "filter": [
+          "**/*.py",
+          "requirements.txt",
+          "!.venv/**",
+          "!models/**",
+          "!*.log",
+          "!test_*.py",
+          "!smoke.py",
+          "!fetch_model.py"
+        ]
+      },
+      {
+        "from": "build",
+        "to": "build",
+        "filter": [
+          "tray*.png"
+        ]
+      },
+      {
+        "from": "kb",
+        "to": "kb",
+        "filter": [
+          "questions.jsonl",
+          "manifest.json"
+        ]
+      },
+      {
+        "from": "build/stt/python",
+        "to": "python"
+      },
+      {
+        "from": "build/stt/model",
+        "to": "models/whisper-large-v3-turbo"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Подсказыч",
+      "artifactName": "Podskazych-Setup-x64.${ext}"
+    }
+  }
+}

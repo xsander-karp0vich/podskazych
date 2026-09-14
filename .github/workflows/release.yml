@@ -1,0 +1,154 @@
+# Релиз Подсказыча: установщик Windows, в котором распознавание речи уже внутри
+# (Python с пакетами, библиотеки C++ и NVIDIA, модель whisper-large-v3-turbo).
+#
+# Запускается тегом v* и собирает черновик релиза. Черновик не виден по ссылке
+# releases/latest, поэтому недокачанный или непроверенный установщик никто не скачает:
+# после проверки черновик публикуется руками.
+#
+# ПЕРЕД ПЕРВЫМ РЕЛИЗОМ (один раз, руками):
+#   1. Модель. Выложить веса int8_float16 отдельным релизом (например, тег
+#      stt-model-v1) одним zip: model.bin, config.json, tokenizer.json,
+#      preprocessor_config.json, vocabulary.json в корне архива. Вписать ссылку
+#      в STT_MODEL_URL ниже. Хэши файлов уже прописаны в шаге «Модель», скачанное
+#      сверяется с ними, так что подменить веса ссылкой не выйдет.
+#   2. Lock-файл пакетов с хэшами — выполнить в корне репозитория и закоммитить:
+#        uv pip compile sidecar/requirements-stt.txt --generate-hashes --python-version 3.14 --python-platform x86_64-pc-windows-msvc -o sidecar/requirements-stt.lock.txt
+#      Без него сборка остановится: ставить пакеты без сверки хэшей в релиз нельзя.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # ручной запуск — только проверить, что всё собирается; релиз не создаётся
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # та же версия, на которой проверен dev-venv (sidecar/.venv/pyvenv.cfg)
+  PYTHON_VERSION: '3.14.0'
+  UV_VERSION: '0.11.23'
+  # ЗАГЛУШКА: ссылка на архив модели в релизе GitHub (см. пункт 1 выше)
+  STT_MODEL_URL: 'https://github.com/xsander-karp0vich/podskazych/releases/download/stt-model-v1/whisper-large-v3-turbo-int8.zip'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # npm test запускает .ts напрямую — нужен Node 24 со снятием типов
+          node-version: 24
+          cache: npm
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Зависимости Node
+        run: npm ci
+
+      # По шагу на команду: pwsh в Actions смотрит код выхода только последней
+      # команды блока, и упавший typecheck в середине прошёл бы незамеченным.
+      - name: Типы
+        run: npm run typecheck
+
+      - name: Тесты
+        run: npm test
+
+      - name: База вопросов
+        run: node scripts/kb-check.mjs
+
+      - name: Python и пакеты распознавания
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lock = 'sidecar/requirements-stt.lock.txt'
+          if (-not (Test-Path $lock)) {
+            throw "Нет $lock. Сгенерируйте его командой из шапки этого файла и закоммитьте."
+          }
+          # python-build-standalone через uv: одна и та же сборка Python при каждом
+          # запуске, версия закреплена вместе с версией uv
+          uv python install $env:PYTHON_VERSION
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv venv sidecar/.venv --python $env:PYTHON_VERSION --managed-python
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv pip install --python sidecar/.venv/Scripts/python.exe --require-hashes --only-binary ':all:' -r $lock
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Модель
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'stt-model'
+          $zip = Join-Path $env:RUNNER_TEMP 'stt-model.zip'
+          curl.exe -sS -L --fail --retry 5 --retry-delay 10 -o $zip $env:STT_MODEL_URL
+          if ($LASTEXITCODE) { throw "Не скачалась модель: $env:STT_MODEL_URL" }
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          tar.exe -xf $zip -C $dir
+          if ($LASTEXITCODE) { throw 'Не распаковался архив модели' }
+          # Сверка с весами, на которых проверено распознавание (конвертация
+          # openai/whisper-large-v3-turbo в CTranslate2 4.8.2, int8_float16).
+          $expected = @{
+            'model.bin'                = '7482f978f9493b93b3d0bf68a148a1a62ca02547e8ee981358ff8ef2de8a9418'
+            'config.json'              = '27ec8ecb8ba05f3ac81522a7a035bd5ab19a5b567640bf68ccec90ded4fc1726'
+            'tokenizer.json'           = '297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd'
+            'preprocessor_config.json' = '7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711'
+            'vocabulary.json'          = '697ee5a65726e46b4d294d1a243d98e1878f5d81caba17891b1c5ebab7a912a9'
+          }
+          foreach ($name in $expected.Keys) {
+            $file = Join-Path $dir $name
+            if (-not (Test-Path $file)) { throw "В архиве модели нет $name (файлы должны лежать в корне архива)" }
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $expected[$name]) { throw "Хэш $name не совпадает: $hash" }
+          }
+          "STT_MODEL_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Рантайм распознавания
+        shell: pwsh
+        # На раннере нет видеокарты: CUDA в проверке пропускается, процессорный путь,
+        # импорты, библиотеки C++ рядом с python.exe и старт asr.py проверяются.
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-stt-runtime.ps1 -ModelSource $env:STT_MODEL_DIR
+
+      - name: Сборка приложения
+        run: npx electron-vite build
+
+      - name: Сборка установщика
+        # публикует шаг «Черновик релиза», а не electron-builder
+        run: npx electron-builder --win --publish never
+
+      - name: Размер и контрольные суммы
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-Item dist/Podskazych-Setup-x64.exe
+          # GitHub не принимает файлы релиза от 2 ГиБ
+          if ($exe.Length -ge 2GB) { throw ("Установщик {0:N0} МБ — больше лимита GitHub в 2 ГиБ" -f ($exe.Length / 1MB)) }
+          '{0:N0} МБ' -f ($exe.Length / 1MB)
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          # LF и без BOM: так файл читает и sha256sum -c
+          [IO.File]::WriteAllText((Join-Path $PWD 'dist/SHA256SUMS.txt'), "$hash  $($exe.Name)`n")
+
+      - name: Черновик релиза
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --verify-tag --title "Подсказыч $tag" --notes "Установщик для Windows 10/11 x64. Проверка файла: SHA256SUMS.txt."
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          gh release upload $tag dist/Podskazych-Setup-x64.exe dist/SHA256SUMS.txt --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

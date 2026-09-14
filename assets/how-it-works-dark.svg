@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="943" height="141" viewBox="0 0 943 141" role="img" aria-label="Звук и микрофон → whisper локально → расшифровка → модель на выбор (Claude, ChatGPT, Cursor, Gemini, Ollama) по Ctrl Shift Space → подсказка → второй агент проверяет факты">
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#f0f6fc">
+<rect x="0.5" y="0.5" width="140" height="52" rx="6" fill="#151b23" stroke="#3d444d"/>
+<text x="70.5" y="23.5" text-anchor="middle">Звук собеседника</text>
+<text x="70.5" y="41.5" text-anchor="middle">и микрофон</text>
+<text x="152.5" y="31.0" text-anchor="middle" font-size="13" fill="#9198a1">→</text>
+<rect x="164.5" y="0.5" width="176" height="52" rx="6" fill="#151b23" stroke="#3d444d"/>
+<text x="252.5" y="23.5" text-anchor="middle">whisper-large-v3-turbo</text>
+<text x="252.5" y="41.5" text-anchor="middle">локально · GPU или CPU</text>
+<text x="352.5" y="31.0" text-anchor="middle" font-size="13" fill="#9198a1">→</text>
+<rect x="364.5" y="0.5" width="113" height="52" rx="6" fill="#151b23" stroke="#3d444d"/>
+<text x="421.0" y="23.5" text-anchor="middle">Расшифровка</text>
+<text x="421.0" y="41.5" text-anchor="middle">двух каналов</text>
+<text x="525.5" y="20.5" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" fill="#9198a1">Ctrl ⇧ Space</text>
+<text x="525.5" y="35.5" text-anchor="middle" font-size="13" fill="#9198a1">→</text>
+<rect x="573.5" y="0.5" width="153" height="52" rx="6" fill="#151b23" stroke="#3d444d"/>
+<text x="650.0" y="23.5" text-anchor="middle">Claude · GPT · Cursor</text>
+<text x="650.0" y="41.5" text-anchor="middle">Gemini · Ollama</text>
+<text x="738.5" y="31.0" text-anchor="middle" font-size="13" fill="#9198a1">→</text>
+<rect x="750.5" y="0.5" width="168" height="52" rx="6" fill="#151b23" stroke="#3d444d"/>
+<text x="834.5" y="23.5" text-anchor="middle">Подсказка тезисами</text>
+<text x="834.5" y="41.5" text-anchor="middle">печатается по словам</text>
+<text x="930.5" y="31.0" text-anchor="middle" font-size="13" fill="#9198a1">→</text>
+<rect x="0.5" y="60.5" width="137" height="52" rx="6" fill="#151b23" stroke="#3d444d"/>
+<text x="69.0" y="83.5" text-anchor="middle">Второй агент</text>
+<text x="69.0" y="101.5" text-anchor="middle">проверяет факты</text>
+<text x="0.5" y="134.5" font-size="12" fill="#9198a1">+ встроенная база вопросов 1С подмешивается в запрос к модели</text>
+</g>
+</svg>

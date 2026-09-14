@@ -1,0 +1,44 @@
+# --- сборка и зависимости ---
+node_modules/
+out/
+dist/
+release/
+# рантайм распознавания для установщика (scripts/build-stt-runtime.ps1):
+# копия Python с пакетами и веса модели, около 1,8 ГБ
+build/stt/
+
+# --- секреты ---
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+
+# --- рабочие заметки: брифы для макетов и история решений с локальными путями ---
+REDESIGN-*.md
+KB-SEARCH.md
+*.head.txt
+.impeccable/
+.claude/
+
+# --- логи и временное ---
+*.log
+.fontcache/
+
+# --- сайдкар: код нужен, начинка нет ---
+# Виртуальное окружение и веса Whisper вместе весят около 4 ГБ и ставятся
+# по requirements.txt и fetch_model.py — в репозитории им делать нечего.
+sidecar/.venv/
+sidecar/models/
+sidecar/__pycache__/
+**/__pycache__/
+*.pyc
+
+# --- отладочные артефакты ---
+*.wav
+*.png
+!build/*.png
+# картинки README: баннеры, скриншот, превью для соцсетей
+!assets/*.png
