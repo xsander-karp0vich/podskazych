@@ -1436,7 +1436,7 @@ void attach_vulkan_details(std::vector<DeviceInfo> & devs) {
 }
 
 // Версия драйвера по-человечески. Кодировка у вендоров своя: NVIDIA — 10.8.8.6 бит
-// (581.29), Intel на Windows — 18.14 (101.6130), остальные — как версия Vulkan.
+// (610.47), Intel на Windows — 18.14 (101.6130), остальные — как версия Vulkan.
 std::string driver_version_text(const VkDetails & v) {
     const uint32_t x = v.driver_version;
     char buf[64];

@@ -96,8 +96,8 @@ ggml (по порядку выбора устройств ggml, имени и PC
 |------|---------|
 | `vendorId`, `deviceId` | PCI-коды: `4098` = 0x1002 AMD, `32902` = 0x8086 Intel, `4318` = 0x10DE NVIDIA |
 | `driverId` | `VkDriverId`: 1 — фирменный AMD, 2 — AMDVLK, 3 — RADV, 4 — NVIDIA, 5 — Intel Windows, 6 — Intel Mesa, 23 — Dozen |
-| `driverName`, `driverInfo` | строки драйвера; у AMD и NVIDIA в `driverInfo` версия пакета драйвера (`24.9.1`, `581.29`) |
-| `driverVersion` | версия драйвера строкой по правилам вендора: NVIDIA `581.29`, Intel на Windows `101.6130`, остальные `major.minor.patch` |
+| `driverName`, `driverInfo` | строки драйвера; в `driverInfo` обычно версия пакета драйвера (у NVIDIA `610.47`) |
+| `driverVersion` | версия драйвера строкой по правилам вендора: NVIDIA `610.47`, Intel на Windows `101.6130`, остальные `major.minor.patch` |
 | `driverVersionRaw` | то же число из `VkPhysicalDeviceProperties.driverVersion` как есть |
 | `apiVersion` | версия Vulkan, которую поддерживает устройство |
 | `architecture` | поколение по правилам ggml (`get_device_architecture`): `amd-gcn` (Polaris/Vega), `amd-rdna1`, `amd-rdna2`, `amd-rdna3`, `intel-xe1`, `intel-xe2`, `nvidia-pre-turing`, `nvidia-turing`, иначе `other` (в том числе NVIDIA новее Turing) |
@@ -130,8 +130,9 @@ GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`) `coopmat`, `coopmat2` и `integerDotProd
 
 - `model` — абсолютный путь в UTF-8, файл открывается через `_wfopen`.
 - `device` — индекс из hello или `-1`: сначала дискретная, потом встроенная.
-- `flashAttn` — на фирменном драйвере AMD для RDNA1/2 у flash attention отдельный путь
-  шейдеров с известными ошибками; при мусоре в тексте перезагружать с `false`.
+- `flashAttn` — на фирменном драйвере AMD для GCN/RDNA1/RDNA2 (`driverId` 1 и
+  `architecture` из hello) у flash attention отдельный путь шейдеров с известными
+  ошибками; при мусоре в тексте перезагружать с `false`.
 - `threads` — потоки процессорной части (1..64, по умолчанию 2).
 
 Повторный `load` освобождает прежнюю модель. Ответ:
