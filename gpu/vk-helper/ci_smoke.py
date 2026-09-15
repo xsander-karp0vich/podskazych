@@ -100,19 +100,6 @@ def check_device(dev):
     return True
 
 
-def find_mock_icd():
-    """Тестовый драйвер Vulkan (Mock ICD) из LunarG SDK: устройство без видеокарты. Нужен,
-    чтобы на раннере прошёл настоящий путь запроса подробностей и сопоставления с ggml."""
-    sdk = os.environ.get("VULKAN_SDK")
-    if not sdk:
-        return None
-    for root, _dirs, files in os.walk(sdk):
-        for name in files:
-            if name.lower() == "vkicd_mock_icd.json":
-                return os.path.join(root, name)
-    return None
-
-
 def expect_error(h, code=None, id_=None, timeout=60):
     msg = h.recv(timeout)
     check(msg["type"] == "error", f"ошибка в ответ ({msg})")
@@ -148,46 +135,43 @@ class ProcHandle:
         self.k32.CloseHandle(ctypes.c_void_p(self.h))
 
 
-def check_mock_icd(exe):
-    icd = find_mock_icd()
-    if not icd:
-        print("  Mock ICD в SDK не найден, проверка подробностей устройства на нём пропущена")
+def wait_stderr(h, needle, timeout_s=10):
+    """stderr читается отдельным потоком: строка, записанная до hello, могла ещё не дойти."""
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        text = h.stderr.decode("utf-8", "replace")
+        if needle in text:
+            return text
+        time.sleep(0.05)
+    return h.stderr.decode("utf-8", "replace")
+
+
+def check_details_switches(exe, h, hello):
+    """Только на машине с видеокартой (на раннере устройств нет, а Mock ICD в Windows-SDK
+    не входит): подробности сверены со строкой ggml, а выключатели GGML_VK_DISABLE_* меняют
+    флаги, но не вендора, драйвер и поколение."""
+    detailed = [d for d in hello["devices"] if check_device(d)]
+    if not detailed:
+        print("  устройств с подробностями нет, проверка выключателей пропущена")
         return
-    print("  Mock ICD:", icd)
-    env = dict(os.environ)
-    # VK_DRIVER_FILES — загрузчики 1.3.207+, VK_ICD_FILENAMES — старые; оба заменяют
-    # список драйверов, а не дополняют его.
-    env["VK_DRIVER_FILES"] = icd
-    env["VK_ICD_FILENAMES"] = icd
-    hm = Helper(exe, env=env)
-    hello = hm.recv(timeout=180)
-    print("  hello (Mock ICD):", json.dumps(hello, ensure_ascii=False))
-    check(hello["type"] == "hello" and isinstance(hello["devices"], list), "Mock ICD: hello пришёл")
-    detailed = [check_device(d) for d in hello["devices"]]
-    # Выключатели ggml должны отражаться во флагах: процесс с ними обязан ответить так же
-    # (сведения из того же драйвера), но без coopmat и integer dot product.
-    env_off = dict(env, GGML_VK_DISABLE_COOPMAT="1", GGML_VK_DISABLE_COOPMAT2="1",
-                   GGML_VK_DISABLE_INTEGER_DOT_PRODUCT="1", GGML_VK_DISABLE_F16="1")
-    ho = Helper(exe, env=env_off)
-    hello_off = ho.recv(timeout=180)
-    print("  hello (Mock ICD, GGML_VK_DISABLE_*):", json.dumps(hello_off, ensure_ascii=False))
-    for d in hello_off["devices"]:
-        if check_device(d):
-            check(not (d["coopmat"] or d["coopmat2"] or d["integerDotProduct"] or d["fp16"]),
-                  f"устройство {d['index']}: GGML_VK_DISABLE_* выключают флаги")
-    errs = []
-    for h in (hm, ho):
-        h.send({"type": "quit"})
-        code = h.proc.wait(timeout=60)
-        h.err_thread.join(timeout=10)
-        err = h.stderr.decode("utf-8", "replace")
-        errs.append(err)
-        print("  stderr (Mock ICD):", err[-1500:])
-        check(code == 0, f"Mock ICD: quit -> код 0 (получен {code})")
-        check("расхождение" not in err, "Mock ICD: сведения совпали со строкой ggml")
-    if hello["devices"]:
-        check(all(detailed), "Mock ICD: у устройств есть подробности")
-        check("сверка с ggml: совпало" in errs[0], "Mock ICD: сведения подтверждены строкой ggml")
+    err = wait_stderr(h, "сверка с ggml")
+    check("сверка с ggml: совпало" in err and "расхождение" not in err, "подробности совпали со строкой ggml")
+    env = dict(os.environ, GGML_VK_DISABLE_COOPMAT="1", GGML_VK_DISABLE_COOPMAT2="1",
+               GGML_VK_DISABLE_INTEGER_DOT_PRODUCT="1", GGML_VK_DISABLE_F16="1")
+    ho = Helper(exe, env=env)
+    off = {d["index"]: d for d in ho.recv(timeout=180)["devices"]}
+    for d in detailed:
+        o = off.get(d["index"], {})
+        print("  с GGML_VK_DISABLE_*:", json.dumps(o, ensure_ascii=False))
+        check(check_device(o), f"устройство {d['index']}: подробности и с выключателями")
+        same = ("vendorId", "deviceId", "driverId", "driverVersionRaw", "driverInfo", "architecture", "uma")
+        check(all(o[k] == d[k] for k in same), f"устройство {d['index']}: вендор, драйвер и поколение те же")
+        check(not (o["coopmat"] or o["coopmat2"] or o["integerDotProduct"] or o["fp16"]),
+              f"устройство {d['index']}: GGML_VK_DISABLE_* выключают флаги")
+    err = wait_stderr(ho, "сверка с ggml")
+    check("расхождение" not in err, "с выключателями подробности совпали со строкой ggml")
+    ho.send({"type": "quit"})
+    check(ho.proc.wait(timeout=60) == 0, "с выключателями: quit -> код 0")
 
 
 def main():
@@ -209,13 +193,10 @@ def main():
     check(hello["version"] == "1.9.4", "whisper_version() == 1.9.4")
     check(isinstance(hello["devices"], list), "devices — список")
     check(hello["cpuOk"] is True, "процессор раннера поддерживает AVX2")
-    for dev in hello["devices"]:
-        check_device(dev)
     no_gpu = len(hello["devices"]) == 0
     if not no_gpu:
         print("  внимание: на раннере нашлись устройства Vulkan, проверка no-device пропускается")
-
-    check_mock_icd(exe)
+    check_details_switches(exe, h, hello)
 
     def in_sync(tag):
         # Следующий ответ обязан быть ошибкой именно на этот запрос: лишних ответов нет.
