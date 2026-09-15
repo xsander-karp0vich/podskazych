@@ -6,6 +6,7 @@ import type { LlmErrorKind } from '../main/llm/types'
 import type { ProviderStatus } from '../main/llm/registry'
 import type { TopicGlossary } from '@shared/glossary'
 import type { ContextFile } from '@shared/contextFiles'
+import type { GpuGate, GpuPackState } from '@shared/gpuPack'
 
 export interface KbHit {
   uid: string
@@ -55,9 +56,19 @@ export interface SidecarInfo {
   fallbackReason: string | null
   loopbackDevice: string | null
   loopbackError: string | null
+  /** итог стартовой проверки видеокарты через Vulkan; null — проверки не было */
+  gpu: GpuGate | null
 }
 
 type SttStartResult = { ok: true; info: SidecarInfo } | { ok: false; error: string }
+
+export interface SttEngineChange {
+  /** cuda | vulkan | cpu */
+  device: string
+  label: string
+  /** почему ушли с видеокарты — от сайдкара, по-русски */
+  reason: string
+}
 
 /*
  * Типы провайдеров — из main, только типами: в сборку preload код main не попадает,
@@ -206,6 +217,18 @@ const api = {
   stopStt: (): Promise<void> => ipcRenderer.invoke('stt:stop'),
   /** Сайдкар завершился сам посреди сессии: переподключаться клиенту больше не к чему. */
   onSttExit: (cb: (p: { error: string }) => void) => subscribe<{ error: string }>('stt:exit', cb),
+  /** Движок сменился посреди сессии (Vulkan → процессор): новая подпись и причина. */
+  onSttEngine: (cb: (p: SttEngineChange) => void) => subscribe<SttEngineChange>('stt:engine', cb),
+
+  // ускорение на видеокарте AMD и Intel: пакет качает и ставит main, окно показывает ход
+  gpuPackState: (): Promise<GpuPackState> => ipcRenderer.invoke('gpu:state'),
+  /** Загрузка идёт минуты: вызов возвращается сразу, ход и итог — в onGpuPackState. */
+  gpuPackDownload: (): Promise<void> => ipcRenderer.invoke('gpu:download'),
+  /** Отменить загрузку; скачанное выбрасывается. */
+  gpuPackCancel: (): Promise<void> => ipcRenderer.invoke('gpu:cancel'),
+  /** Удалить пакет; во время сессии — отложить до её конца. */
+  gpuPackRemove: (): Promise<void> => ipcRenderer.invoke('gpu:remove'),
+  onGpuPackState: (cb: (s: GpuPackState) => void) => subscribe<GpuPackState>('gpu:state', cb),
 
   // скриншот
   listScreens: (): Promise<Array<{ id: string; label: string; primary: boolean }>> =>

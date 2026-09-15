@@ -14,6 +14,7 @@ import { Mascot } from './Mascot'
 import { ProviderSetup, type ProvidersCtl } from './ProviderPicker'
 import { ContextFiles } from './ContextFiles'
 import type { ContextFile } from '@shared/contextFiles'
+import { gpuRowView, type GpuAction, type GpuPackState } from '@shared/gpuPack'
 import { chipOf, isReady, noteOf, promptReachesModel, verifyDepthNote, verifyEffortsOf, viaOf } from '../providerStatus'
 
 type Tab = 'general' | 'prompt' | 'glossary' | 'records' | 'account' | 'hotkeys' | 'guide'
@@ -270,6 +271,21 @@ export function Settings({
     return window.copilot.onKbSnapshot(setSnap)
   }, [tab])
 
+
+  // Пакет ускорения на видеокарте: загрузка идёт в main и переживает закрытие окна — здесь только её ход.
+  const [gpu, setGpu] = useState<GpuPackState | null>(null)
+  useEffect(() => {
+    if (tab !== 'general') return
+    const off = window.copilot.onGpuPackState(setGpu)
+    void window.copilot.gpuPackState().then(setGpu)
+    return off
+  }, [tab])
+  const gpuRow = gpu ? gpuRowView(gpu) : null
+  const gpuAction = (id: GpuAction) => {
+    if (id === 'download') void window.copilot.gpuPackDownload()
+    else if (id === 'cancel') void window.copilot.gpuPackCancel()
+    else void window.copilot.gpuPackRemove()
+  }
 
   useEffect(() => {
     const esc = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
@@ -671,7 +687,7 @@ export function Settings({
                   desc={`Значка Подсказыча не будет рядом с часами. ${hideText ? `Панель прячется и возвращается клавишами ${hideText}, а если` : 'Если'} запустить Подсказыч ещё раз, откроется уже запущенный. Если клики идут сквозь панель или она спрятана, а клавиши для этого нет, значок вернётся сам — иначе приложением было бы нечем управлять.`}
                 />
                 <Row
-                  last
+                  last={!gpuRow || gpuRow.hidden}
                   name="Распознавание речи"
                   control={
                     <span className="stt-info">
@@ -681,6 +697,35 @@ export function Settings({
                   }
                   desc="Звук и распознавание не покидают компьютер."
                 />
+                {/* Нет AMD или Intel, или распознавание уже на CUDA — строки нет вовсе: предлагать нечего. */}
+                {gpuRow && !gpuRow.hidden && (
+                  <Row
+                    last
+                    name="Ускорение на видеокарте"
+                    control={
+                      <span className="setup-actions" style={{ alignItems: 'center', justifyContent: 'flex-end' }}>
+                        {gpuRow.meter && <span className="stt-info">{gpuRow.meter}</span>}
+                        {gpuRow.badge && (
+                          <span className={`status-badge ${gpuRow.badge.tone}`}>
+                            <i />
+                            {gpuRow.badge.text}
+                          </span>
+                        )}
+                        {gpuRow.actions.map((a) => (
+                          <button
+                            key={a.id}
+                            type="button"
+                            className={a.danger ? 'btn-danger' : 'btn-secondary'}
+                            onClick={() => gpuAction(a.id)}
+                          >
+                            {a.label}
+                          </button>
+                        ))}
+                      </span>
+                    }
+                    desc={gpuRow.desc}
+                  />
+                )}
               </>
             )}
 

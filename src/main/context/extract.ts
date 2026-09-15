@@ -1,4 +1,4 @@
-import { inflateRawSync } from 'node:zlib'
+import { ZipError, inflateZipEntrySync, zipEntries, type ZipProblem } from '../zip.ts'
 import {
   CONTEXT_MAX_FILE_BYTES,
   CONTEXT_MAX_FILE_CHARS,
@@ -95,9 +95,6 @@ export function decodeText(bytes: Uint8Array): string {
 
 /* ---------- DOCX: ZIP ---------- */
 
-const SIG_EOCD = 0x06054b50
-const SIG_CENTRAL = 0x02014b50
-const SIG_LOCAL = 0x04034b50
 /** Записей в настоящем .docx — десятки. Тысячи — это уже не документ, а ловушка для разборщика. */
 export const ZIP_MAX_ENTRIES = 5000
 /**
@@ -109,60 +106,28 @@ export const ZIP_MAX_ENTRY_BYTES = 50 * 1024 * 1024
 const BROKEN_DOCX = 'Файл повреждён или это не документ Word (.docx)'
 const ZIP_BOMB = 'Файл распаковывается в слишком большой объём — похоже на повреждённый или подложный .docx'
 
+const ZIP_TEXT: Record<ZipProblem, string> = {
+  broken: BROKEN_DOCX,
+  bomb: ZIP_BOMB,
+  encrypted: 'Документ защищён паролем — снимите защиту в Word и добавьте файл снова',
+}
+
 /**
- * Одна запись ZIP по имени. Идём по центральному каталогу, а не по локальным заголовкам:
- * размеры в локальном заголовке бывают нулями (дескриптор данных после записи), в каталоге — всегда верные.
- * null — записи с таким именем нет.
+ * Одна запись ZIP по имени; null — записи с таким именем нет. Сам разбор каталога — общий
+ * с пакетом ускорения (../zip.ts), здесь только лимиты .docx и причины по-русски для списка файлов.
  */
 export function readZipEntry(zip: Buffer, name: string): Buffer | null {
-  if (zip.length < 22) throw new ContextError(BROKEN_DOCX)
-  // Конец каталога — последние 22 байта плюс комментарий архива до 65 535 байт.
-  let eocd = -1
-  for (let i = zip.length - 22, min = Math.max(0, zip.length - 22 - 0xffff); i >= min; i--) {
-    if (zip.readUInt32LE(i) === SIG_EOCD) {
-      eocd = i
-      break
-    }
-  }
-  if (eocd < 0) throw new ContextError(BROKEN_DOCX)
-  const total = zip.readUInt16LE(eocd + 10)
-  const cdOffset = zip.readUInt32LE(eocd + 16)
-  // ZIP64 Word не пишет: документ до 4 ГБ в него не попадает.
-  if (total === 0xffff || cdOffset === 0xffffffff) throw new ContextError(BROKEN_DOCX)
-  if (total > ZIP_MAX_ENTRIES) throw new ContextError(ZIP_BOMB)
-
-  let p = cdOffset
-  for (let i = 0; i < total; i++) {
-    if (p + 46 > zip.length || zip.readUInt32LE(p) !== SIG_CENTRAL) throw new ContextError(BROKEN_DOCX)
-    const flags = zip.readUInt16LE(p + 8)
-    const method = zip.readUInt16LE(p + 10)
-    const compSize = zip.readUInt32LE(p + 20)
-    const size = zip.readUInt32LE(p + 24)
-    const nameLen = zip.readUInt16LE(p + 28)
-    const extraLen = zip.readUInt16LE(p + 30)
-    const commentLen = zip.readUInt16LE(p + 32)
-    const local = zip.readUInt32LE(p + 42)
-    const entry = zip.toString('utf8', p + 46, Math.min(zip.length, p + 46 + nameLen))
-    p += 46 + nameLen + extraLen + commentLen
-    if (entry !== name) continue
-
-    if (flags & 1) throw new ContextError('Документ защищён паролем — снимите защиту в Word и добавьте файл снова')
-    if (size > ZIP_MAX_ENTRY_BYTES) throw new ContextError(ZIP_BOMB)
-    if (local + 30 > zip.length || zip.readUInt32LE(local) !== SIG_LOCAL) throw new ContextError(BROKEN_DOCX)
-    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28)
-    if (start + compSize > zip.length) throw new ContextError(BROKEN_DOCX)
-    const data = zip.subarray(start, start + compSize)
-    if (method === 0) return Buffer.from(data)
-    if (method !== 8) throw new ContextError(BROKEN_DOCX)
-    try {
+  try {
+    for (const entry of zipEntries(zip, ZIP_MAX_ENTRIES)) {
+      if (entry.name !== name) continue
       // Размер из каталога может врать: лимит на выход держит бомбу и тогда.
-      return inflateRawSync(data, { maxOutputLength: ZIP_MAX_ENTRY_BYTES })
-    } catch (e) {
-      const code = (e as { code?: unknown }).code
-      throw new ContextError(e instanceof RangeError || code === 'ERR_BUFFER_TOO_LARGE' ? ZIP_BOMB : BROKEN_DOCX)
+      return inflateZipEntrySync(zip, entry, ZIP_MAX_ENTRY_BYTES)
     }
+    return null
+  } catch (e) {
+    if (e instanceof ZipError) throw new ContextError(ZIP_TEXT[e.problem])
+    throw e
   }
-  return null
 }
 
 /* ---------- DOCX: XML ---------- */

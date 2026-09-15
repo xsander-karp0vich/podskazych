@@ -114,6 +114,11 @@ export interface AppSettings {
   contextFiles: ContextFile[]
   /** обучение при первом запуске пройдено или пропущено — само больше не показывается */
   onboardingDone: boolean
+  /**
+   * Подсказку «есть ускорение для AMD и Intel» в строке панели скрыли навсегда. Скачать пакет
+   * по-прежнему можно в «Настройки → Основные» — скрывается только напоминание.
+   */
+  gpuHintHidden: boolean
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -151,6 +156,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   customPrompt: '',
   contextFiles: [],
   onboardingDone: false,
+  gpuHintHidden: false,
 }
 
 /**
@@ -251,6 +257,8 @@ export function migrateSettings(raw: unknown): AppSettings {
     verifyWeb: saved.verifyWeb === true,
     // Строго true: спрятать значок по битому значению — оставить приложение без запасного выхода.
     hideTray: saved.hideTray === true,
+    // Строго true: подсказку прячут только сами, битое значение её не глушит.
+    gpuHintHidden: saved.gpuHintHidden === true,
     // Список файлов правят руками и сбои записи: битые строки отбрасываем, остальные оставляем.
     contextFiles: contextFilesOf(src.contextFiles),
   }

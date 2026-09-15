@@ -1,15 +1,25 @@
 import Anthropic from '@anthropic-ai/sdk'
-import { ProxyAgent, setGlobalDispatcher } from 'undici'
+import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici'
+
+/** Свой компьютер через прокси не ходит никогда: прокси такой адрес либо не знает, либо отвечает 503. */
+const LOOPBACK = ['localhost', '127.0.0.1', '::1']
 
 /**
  * Node-овский fetch (undici) НЕ читает системный прокси Windows и не смотрит
  * на HTTP_PROXY сам по себе — в отличие от Chromium. Без этого запрос к Клоду
  * уходит мимо прокси и висит до таймаута при «включённом VPN».
+ *
+ * NO_PROXY при этом соблюдается: ProxyAgent его не читал, и через прокси уходило всё подряд —
+ * адрес зеркала пакета для видеокарты из NO_PROXY и локальный COPILOT_GPU_PACK_URL получали 503 от прокси.
+ * Один адрес прокси на http и https, как было: HTTPS_PROXY, иначе HTTP_PROXY.
  */
 export function configureProxy(): string | null {
   const url = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY ?? null
   if (!url) return null
-  setGlobalDispatcher(new ProxyAgent(url))
+  const env = (process.env.NO_PROXY ?? process.env.no_proxy ?? '').trim()
+  // «*» undici понимает только целиком: с добавленными адресами он стал бы именем хоста.
+  const noProxy = env === '*' ? env : [env, ...LOOPBACK].filter(Boolean).join(',')
+  setGlobalDispatcher(new EnvHttpProxyAgent({ httpProxy: url, httpsProxy: url, noProxy }))
   return url
 }
 

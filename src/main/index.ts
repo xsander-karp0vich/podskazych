@@ -1,7 +1,8 @@
 import { app, BrowserWindow, clipboard, session, desktopCapturer, dialog, ipcMain, screen, shell } from 'electron'
 import { createOverlayWindow, applyContentProtection, setClickThrough, canExcludeFromCapture } from './window'
 import { registerHotkeys, unregisterHotkeys, type HotkeyBindings } from './hotkeys'
-import { SttSidecar } from './stt/sidecar'
+import { SttSidecar, sttCacheDir } from './stt/sidecar'
+import { GpuPackManager } from './gpu/pack'
 import { createTray, type TrayHandle } from './tray'
 import { parseTrayPref, serializeTrayPref, shouldShowTray } from './trayVisibility'
 import { createClickThrough } from './clickThrough'
@@ -168,6 +169,11 @@ function restartWithoutOverlay(reason: string): void {
 }
 
 const stt = new SttSidecar()
+/**
+ * Пакет ускорения на видеокартах AMD и Intel. Создаётся при готовности приложения: список видеокарт
+ * Chromium отдаёт только после ready.
+ */
+let gpuPack: GpuPackManager | null = null
 let kbMeta: KbMeta | null = null
 /** база ещё грузится: окно настроек тогда ждёт, а не показывает ошибку */
 let kbLoading = true
@@ -889,7 +895,9 @@ app.whenReady().then(() => {
   // дёргаем его по кнопке «Старт», а не при запуске приложения.
   ipcMain.handle('stt:start', async (_e, opts: { language?: string; glossary?: string }) => {
     try {
-      const info = await stt.start(opts)
+      // Пакет на видеокарте — если установлен; отложенное с прошлой сессии удаление выполнится до запуска.
+      const info = await stt.start({ ...opts, gpuPack: await gpuPack?.forSidecar() })
+      gpuPack?.noteReady(info)
       // Запись созвона живёт ровно столько же, сколько сессия распознавания.
       journal.open()
       return { ok: true as const, info }
@@ -901,12 +909,42 @@ app.whenReady().then(() => {
   ipcMain.handle('stt:stop', () => {
     stt.stop()
     journal.close()
+    void gpuPack?.sessionEnded()
   })
 
   // Сайдкар упал посреди созвона. Без этого окно переподключалось бы к мёртвому
   // порту до «Стоп», не объясняя, куда пропала расшифровка. Журнал закроет «Стоп»
   // из окна, как при обычной остановке.
-  stt.onExit = (error) => overlay?.webContents.send('stt:exit', { error })
+  stt.onExit = (error) => {
+    overlay?.webContents.send('stt:exit', { error })
+    void gpuPack?.sessionEnded()
+  }
+
+  // Видеокарта через Vulkan сбоила посреди созвона, сайдкар сам ушёл на процессор: окну — новая подпись
+  // и короткое объяснение, строке настроек — итог сессии (следующий старт тоже будет на процессоре).
+  stt.onEngine = (info, reason) => {
+    overlay?.webContents.send('stt:engine', { device: info.device, label: info.label, reason })
+    gpuPack?.noteReady(info)
+  }
+
+  /* ---------- ускорение на видеокарте ---------- */
+
+  gpuPack = new GpuPackManager({
+    statePath: join(app.getPath('userData'), 'gpu-pack.json'),
+    sttCacheDir: sttCacheDir(),
+    sessionActive: () => stt.running,
+    onChange: (s) => {
+      if (overlay && !overlay.isDestroyed() && !overlay.webContents.isDestroyed()) overlay.webContents.send('gpu:state', s)
+    },
+  })
+  const pack = gpuPack
+  ipcMain.handle('gpu:state', () => pack.state())
+  // Загрузка — минуты: ответ сразу, ход и итог приходят в 'gpu:state'.
+  ipcMain.handle('gpu:download', () => {
+    void pack.download()
+  })
+  ipcMain.handle('gpu:cancel', () => pack.cancel())
+  ipcMain.handle('gpu:remove', () => pack.remove())
 
   /* ---------- журнал созвонов ---------- */
 
@@ -1486,6 +1524,8 @@ app.on('will-quit', () => {
   unregisterHotkeys()
   journal.close()
   stt.stop()
+  // Загрузка пакета обрывается, но скачанное остаётся: следующий запуск докачает.
+  gpuPack?.shutdown()
   // Выход — отмена, а не сбой: иначе оборванная подсказка открыла бы новую запись в уже закрытом журнале.
   registry.stopAll(new CancelledError())
   quitting = true

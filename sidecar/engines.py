@@ -7,6 +7,8 @@
 
 Устройство выбирается по железу:
   видеокарта NVIDIA — CUDA, как было всегда;
+  видеокарта AMD/Intel — Vulkan, если скачан пакет (помощник + модель ggml) и
+      стартовая проверка показала, что он быстрее процессора, см. vulkan.py;
   всё остальное — процессор. Та же модель и тот же словарь, поэтому термины 1С
       распознаются так же. Скорость даёт короткое окно кодировщика, см. CpuWindow.
 
@@ -145,6 +147,27 @@ def compression_ratio(text: str) -> float:
     return len(raw) / max(1, len(zlib.compress(raw)))
 
 
+def fit_hotwords(count, terms: list) -> tuple[str, dict]:
+    """Текст словаря из терминов по приоритету, уложенный в бюджет токенов.
+
+    Одна функция на все движки: на Vulkan подсказка должна совпадать с CUDA и
+    процессором байт в байт, иначе замеры качества этапа 2 к ней не относятся.
+    count(text) — сколько токенов займёт текст у HF-токенизатора.
+
+    Порядок — это приоритет, поэтому на первом же термине, который не влез,
+    останавливаемся и не пробуем следующие: иначе важное вылетало бы ради
+    мелкого, которое просто оказалось короче.
+    """
+    clean = [str(t).strip() for t in terms if str(t).strip()]
+    kept: list = []
+    for term in clean:
+        if count(f"{HOTWORDS_LEAD} {', '.join(kept + [term])}.") > HOTWORDS_BUDGET:
+            break
+        kept.append(term)
+    text = f"{HOTWORDS_LEAD} {', '.join(kept)}." if kept else ""
+    return text, {"kept": len(kept), "total": len(clean), "tokens": count(text) if text else 0}
+
+
 class Engine:
     name = "faster-whisper"
 
@@ -196,13 +219,10 @@ class Engine:
         self.suppress = get_suppressed_tokens(self.tokenizer, [-1])
 
     def set_terms(self, terms: list) -> dict:
-        """Собрать hotwords из терминов по приоритету и уложить в бюджет.
+        """Собрать hotwords из терминов по приоритету и уложить в бюджет (fit_hotwords).
 
         Считаем тем же токенизатором, которым faster-whisper закодирует
-        подсказку: на глаз оценка у кириллицы врёт в разы. Порядок — это
-        приоритет, поэтому на первом же термине, который не влез, останавливаемся
-        и не пробуем следующие: иначе важное вылетало бы ради мелкого, которое
-        просто оказалось короче.
+        подсказку: на глаз оценка у кириллицы врёт в разы.
 
         Присваивание строки атомарно, поэтому менять словарь можно прямо во
         время распознавания: текущая фраза дойдёт со старым, следующая — с новым.
@@ -212,15 +232,9 @@ class Engine:
         def count(text: str) -> int:
             return len(tok.encode(" " + text, add_special_tokens=False).ids)
 
-        clean = [str(t).strip() for t in terms if str(t).strip()]
-        kept: list = []
-        for term in clean:
-            if count(f"{HOTWORDS_LEAD} {', '.join(kept + [term])}.") > HOTWORDS_BUDGET:
-                break
-            kept.append(term)
-        text = f"{HOTWORDS_LEAD} {', '.join(kept)}." if kept else ""
+        text, info = fit_hotwords(count, terms)
         self.hotwords = text
-        return {"kept": len(kept), "total": len(clean), "tokens": count(text) if text else 0}
+        return info
 
     # сколько занял прогрев; 0 — ещё не грелись
     warm_up_s = 0.0
@@ -272,6 +286,13 @@ class Engine:
             span += max(0.0, float(seg.end) - float(seg.start))
         return " ".join(kept).strip(), span
 
+    def encoder_window(self, audio_s: float) -> float | None:
+        """Окно кодировщика в секундах для такого звука; None — полное, 30 с.
+
+        Очередь в asr.py считает стоимость прогона по окну, а не по длине фразы.
+        """
+        return self._cpu_window(audio_s) if self.device == "cpu" else None
+
     @staticmethod
     def _cpu_window(dur_s: float) -> int | None:
         for w in CPU_WINDOWS_S:
@@ -315,7 +336,7 @@ class Engine:
         return text
 
 
-def probe(whisper_model: str) -> dict:
+def probe(whisper_model: str, vk_helper: str | None = None, ggml_model: str | None = None) -> dict:
     """Что есть на машине — без загрузки модели."""
     info: dict = {"cudaDevices": cuda_devices(), "cpuCount": os.cpu_count() or 0, "cpuThreads": cpu_threads()}
     try:
@@ -325,6 +346,8 @@ def probe(whisper_model: str) -> dict:
     except Exception:
         info["cudaComputeTypes"] = []
     info["whisperLocal"] = os.path.isfile(os.path.join(whisper_model, "model.bin"))
+    # Пакет Vulkan на месте — помощник не запускаем: перечисление устройств идёт секунды
+    info["vulkanPack"] = bool(vk_helper and ggml_model and os.path.isfile(vk_helper) and os.path.isfile(ggml_model))
     return info
 
 
@@ -335,12 +358,24 @@ def select_engine(
     compute_type: str,
     glossary: str,
     log,
+    vk_helper: str | None = None,
+    ggml_model: str | None = None,
+    cache_dir: str | None = None,
+    noise=None,
+    event=None,
 ) -> tuple[Engine, str | None]:
     """Поднять распознавание. Возвращает движок и причину, по которой он не на CUDA.
 
     auto: сначала CUDA — с прогоном вхолостую, потому что отсутствие cuBLAS или
     несовместимый драйвер обнаруживаются только на первом распознавании.
-    Не вышло — та же модель на процессоре.
+    Не вышло — Vulkan, если пакет скачан (--vk-helper и --ggml-model) и стартовая
+    проверка его пустила. Не вышло и это — та же модель на процессоре.
+    vulkan: только Vulkan, без перехода на процессор по скорости; не поднялся — ошибка.
+
+    У возвращённого движка всегда есть vulkan_info: итог проверки Vulkan для
+    приложения (None — пакета нет и Vulkan не пробовали).
+    noise(text, dur_s, audio_s) — фильтр выдумок из asr.py для проверки текста,
+    event(name, **fields) — событие в stdout.
     """
 
     def cpu() -> Engine:
@@ -349,21 +384,52 @@ def select_engine(
         return e
 
     if device == "cpu":
-        return cpu(), "процессор выбран вручную"
+        e = cpu()
+        e.vulkan_info = None
+        return e, "процессор выбран вручную"
 
     reason: str | None = None
-    if not cuda_devices():
-        reason = "нет видеокарты NVIDIA с CUDA"
-        if device == "cuda":
-            raise EngineError("no-cuda", "Видеокарта NVIDIA с CUDA не найдена.")
-    else:
-        try:
-            e = Engine(whisper_model, "cuda", compute_type, language, glossary)
-            e.warm_up()
-            return e, None
-        except Exception as ex:  # драйвер старый, памяти мало, нет cuBLAS
+    if device != "vulkan":
+        if not cuda_devices():
+            reason = "нет видеокарты NVIDIA с CUDA"
             if device == "cuda":
-                raise
-            reason = f"CUDA не заработала: {ex}"
-            log(f"CUDA не заработала, переходим на процессор: {ex}")
-    return cpu(), reason
+                raise EngineError("no-cuda", "Видеокарта NVIDIA с CUDA не найдена.")
+        else:
+            try:
+                e = Engine(whisper_model, "cuda", compute_type, language, glossary)
+                e.warm_up()
+                e.vulkan_info = None
+                return e, None
+            except Exception as ex:  # драйвер старый, памяти мало, нет cuBLAS
+                if device == "cuda":
+                    raise
+                reason = f"CUDA не заработала: {ex}"
+                log(f"CUDA не заработала, переходим на процессор: {ex}")
+
+    vk_info = None
+    cpu_engine = None
+    if device == "vulkan" or (vk_helper and ggml_model):
+        # Модуль грузим только здесь: без пакета он не нужен вовсе
+        import vulkan
+
+        forced = device == "vulkan"
+        engine, cpu_engine, why, vk_info = vulkan.open_engine(
+            forced=forced,
+            vk_helper=vk_helper,
+            ggml_model=ggml_model,
+            whisper_model=whisper_model,
+            cache_dir=cache_dir,
+            language=language,
+            glossary=glossary,
+            cpu_factory=cpu,
+            log=log,
+            event=event,
+            noise=noise,
+        )
+        if engine is not None:
+            engine.vulkan_info = vk_info
+            return engine, ("Vulkan выбран вручную" if forced else reason)
+        reason = f"{reason}; Vulkan: {why}" if reason else f"Vulkan: {why}"
+    e = cpu_engine if cpu_engine is not None else cpu()
+    e.vulkan_info = vk_info
+    return e, reason

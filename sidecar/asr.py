@@ -572,6 +572,7 @@ class Transcriber:
         warm = float(getattr(engine, "warm_up_s", 0.0) or 0.0)
         if warm > 0:
             self._cost[self._window(1.0)] = warm
+        self._epoch = getattr(engine, "epoch", 0)
         self._wake: asyncio.Event | None = None
         self._worker: asyncio.Task | None = None
 
@@ -608,10 +609,27 @@ class Transcriber:
 
     # --- оценка стоимости и загрузки ---
 
-    def _window(self, audio_s: float) -> int:
+    def _window(self, audio_s: float) -> float:
+        # Окно называет сам движок: у процессора 10/15/20 с, у Vulkan в режиме
+        # лесенки 20.48/25.6 с, у CUDA и полного окна — None, то есть 30 с.
+        enc = getattr(self.engine, "encoder_window", None)
+        if enc is not None:
+            return enc(audio_s) or 30
         pick = getattr(self.engine, "_cpu_window", None)
         w = pick(audio_s) if (pick is not None and self.idle_partials) else None
         return w or 30
+
+    def _follow_engine(self) -> None:
+        """Движок сменил устройство посреди сессии (Vulkan упал — теперь процессор):
+        оценки стоимости прошлого устройства к новому не относятся."""
+        epoch = getattr(self.engine, "epoch", 0)
+        if epoch == self._epoch:
+            return
+        self._epoch = epoch
+        self._cost.clear()
+        warm = float(getattr(self.engine, "warm_up_s", 0.0) or 0.0)
+        if warm > 0:
+            self._cost[self._window(1.0)] = warm
 
     def expected_cost(self, audio_s: float) -> float:
         """Сколько, скорее всего, займёт прогон такой длины. Стоимость задаёт окно
@@ -884,10 +902,20 @@ class Transcriber:
             self._busy.append((started, ended))
             while self._busy and self._busy[0][1] < ended - LOAD_WINDOW_S:
                 self._busy.popleft()
-            if not failed:
+            if getattr(self.engine, "epoch", 0) != self._epoch:
+                # Этот прогон уже шёл на новом устройстве после сбоя старого,
+                # и в его цене — загрузка модели: в оценку не берём.
+                self._follow_engine()
+            elif not failed:
                 w = self._window(audio.size / SAMPLE_RATE)
                 old = self._cost.get(w)
                 self._cost[w] = self.last_run_s if old is None else old + COST_EMA * (self.last_run_s - old)
+                if final:
+                    # Сторож Vulkan: финалы вдвое дороже, чем на стартовой проверке, —
+                    # видеокарту заняли, пора на процессор (vulkan.VulkanEngine.note_final)
+                    watch = getattr(self.engine, "note_final", None)
+                    if watch is not None:
+                        watch(audio.size / SAMPLE_RATE, self.last_run_s)
             if not final:
                 pipe.partial_done = ended
         try:
@@ -1267,17 +1295,25 @@ class Hub:
                     self.drop(channel, ws)
 
 
+def _emit(obj: dict) -> None:
+    # Одной записью, а не print: print пишет строку и перевод строки двумя
+    # вызовами, а события теперь идут и из потока, читающего stderr помощника
+    # Vulkan. Чужая строка между ними склеила бы два JSON в одну нечитаемую.
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
 def fatal(code: str, message: str) -> None:
     """Последнее слово перед выходом: приложение покажет message вместо трассировки."""
-    print(json.dumps({"fatal": {"code": code, "message": message}}, ensure_ascii=False), flush=True)
+    _emit({"fatal": {"code": code, "message": message}})
 
 
 def log_error(message: str) -> None:
-    print(json.dumps({"error": message}, ensure_ascii=False), flush=True)
+    _emit({"error": message})
 
 
 def log_event(name: str, **fields) -> None:
-    print(json.dumps({"event": name, **fields}, ensure_ascii=False), flush=True)
+    _emit({"event": name, **fields})
 
 
 def parse_args() -> argparse.Namespace:
@@ -1289,8 +1325,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--compute-type", default="int8_float16")
     ap.add_argument("--language", default="ru")
     ap.add_argument("--glossary", default="")
-    # auto — видеокарта NVIDIA, если CUDA заработала, иначе процессор
-    ap.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    # auto — видеокарта NVIDIA, если CUDA заработала; иначе Vulkan, если пакет
+    # скачан и стартовая проверка его пустила; иначе процессор.
+    # vulkan — только Vulkan (разработка и проверка на AMD/Intel)
+    ap.add_argument("--device", choices=("auto", "cuda", "cpu", "vulkan"), default="auto")
+    # Пакет ускорения на AMD/Intel: помощник podskazych-vk.exe и модель ggml.
+    # Приложение передаёт оба, только если пакет установлен.
+    ap.add_argument("--vk-helper")
+    ap.add_argument("--ggml-model")
+    # Куда помнить итог стартовой проверки Vulkan и сбои (userData/stt-cache)
+    ap.add_argument("--cache-dir")
     # напечатать, что есть на машине, и выйти — без загрузки модели
     ap.add_argument("--probe", action="store_true")
     args = ap.parse_args()
@@ -1307,6 +1351,11 @@ async def main(args: argparse.Namespace) -> None:
         args.compute_type,
         args.glossary,
         log_error,
+        vk_helper=getattr(args, "vk_helper", None),
+        ggml_model=getattr(args, "ggml_model", None),
+        cache_dir=getattr(args, "cache_dir", None),
+        noise=looks_like_noise,
+        event=log_event,
     )
     transcriber = Transcriber(engine)
     t0 = time.monotonic()
@@ -1383,13 +1432,13 @@ async def main(args: argparse.Namespace) -> None:
         Отставание раньше было видно только по тому, что строки перестали
         приходить. Теперь приложение может сказать об этом словами.
         """
-        device = "cuda" if getattr(engine, "device", "cpu") == "cuda" else "cpu"
         while True:
             await asyncio.sleep(HEALTH_EVERY_S)
             backlog, queued = transcriber.backlog()
             await hub.broadcast(json.dumps({
                 "type": "health",
-                "device": device,
+                # Каждый раз заново: Vulkan после сбоя посреди сессии становится процессором
+                "device": getattr(engine, "device", "cpu"),
                 "load": round(transcriber.load(LOAD_WINDOW_S), 2),
                 # секунды звука в очереди — для диагностики
                 "backlogS": round(backlog, 1),
@@ -1501,6 +1550,9 @@ async def main(args: argparse.Namespace) -> None:
             "computeType": engine.compute_type,
             # почему работаем не на видеокарте NVIDIA; None — всё штатно
             "fallbackReason": fallback,
+            # итог стартовой проверки Vulkan: tier fast|ladder|mid|cpu, device,
+            # flashAttn, tFullMs, tLadderMs, tCpuMs, cached, reason; None — пакета нет
+            "vulkan": getattr(engine, "vulkan_info", None),
             "loopbackDevice": capture.device_name,
             "loopbackError": capture.error,
         }, ensure_ascii=False),
@@ -1520,7 +1572,7 @@ if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     args = parse_args()
     if args.probe:
-        print(json.dumps({"probe": probe(args.model)}, ensure_ascii=False), flush=True)
+        print(json.dumps({"probe": probe(args.model, args.vk_helper, args.ggml_model)}, ensure_ascii=False), flush=True)
         sys.exit(0)
     try:
         asyncio.run(main(args))

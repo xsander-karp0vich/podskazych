@@ -5,18 +5,22 @@ import { dirname, join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { appendFile, mkdir, rename, stat } from 'node:fs/promises'
 import { app } from 'electron'
+import { gateAfterFallback, gateOfReady, type GpuGate } from '@shared/gpuPack'
 
 export interface SidecarInfo {
   port: number
   token: string
   model: string
+  /** cuda | vulkan | cpu */
   device: string
   /** движок распознавания */
   engine: string
-  /** подпись для строки состояния: «whisper-large-v3-turbo · cuda» или «… · процессор» */
+  /** подпись для строки состояния: «… · cuda», «… · видеокарта AMD Radeon RX 5700 XT (Vulkan)» или «… · процессор» */
   label: string
-  /** почему работаем не на видеокарте NVIDIA; null — всё штатно */
+  /** почему работаем не на видеокарте NVIDIA (и не через Vulkan); null — всё штатно */
   fallbackReason: string | null
+  /** итог стартовой проверки видеокарты через Vulkan; null — пакета нет или сайдкар её не делал */
+  gpu: GpuGate | null
   /** какое устройство вывода слушаем как «собеседника» */
   loopbackDevice: string | null
   /** если захват системного звука не завёлся — причина */
@@ -52,7 +56,8 @@ const MODEL_DIR = 'whisper-large-v3-turbo'
  *   COPILOT_SIDECAR_DATA — папка, где лежат .venv и models (как sidecar/ в репозитории)
  *   COPILOT_PYTHON       — прямой путь к python.exe
  *   COPILOT_MODEL        — прямой путь к папке с весами
- *   COPILOT_STT_DEVICE   — auto | cuda | cpu; cpu — проверить режим компьютера без NVIDIA
+ *   COPILOT_STT_DEVICE   — auto | cuda | vulkan | cpu; cpu — проверить режим компьютера без NVIDIA,
+ *                          vulkan — видеокарта через пакет ускорения, даже если медленнее процессора
  */
 function sidecarPaths() {
   const packaged = app.isPackaged
@@ -75,7 +80,20 @@ function sidecarPaths() {
   }
 }
 
-const DEVICES = new Set(['auto', 'cuda', 'cpu'])
+/**
+ * Кэш сайдкара (--cache-dir): итоги стартовой проверки видеокарты, флаг её сбоя, замер процессора.
+ * Пакет ускорения чистит отсюда итоги при установке и удалении — путь один на обоих.
+ */
+export const sttCacheDir = (): string => join(app.getPath('userData'), 'stt-cache')
+
+/** vulkan без пакета сайдкар отработает сам: скажет причину и перейдёт на процессор. */
+const DEVICES = new Set(['auto', 'cuda', 'vulkan', 'cpu'])
+
+/** Помощник и модель пакета ускорения на видеокарте (gpu/pack.ts), если он установлен. */
+export interface SttGpuPack {
+  helper: string
+  model: string
+}
 
 const BROKEN_INSTALL = 'Установка Подсказыча повреждена'
 
@@ -180,8 +198,20 @@ export class SttSidecar {
    * Окну надо перестать переподключаться и показать причину.
    */
   onExit: ((error: string) => void) | null = null
+  /**
+   * Движок сменился посреди сессии: видеокарта через Vulkan сбоила или замедлилась, и сайдкар сам перешёл
+   * на процессор. Звук идёт дальше, но подпись в окне и строка настроек иначе до конца сессии врали бы «Vulkan».
+   */
+  onEngine: ((info: SidecarInfo, reason: string) => void) | null = null
 
-  async start(opts: { language?: string; glossary?: string; model?: string } = {}): Promise<SidecarInfo> {
+  /** Процесс запущен — от «Старт» до «Стоп» или выхода. Пока он жив, файлы пакета на видеокарте заняты. */
+  get running(): boolean {
+    return this.proc !== null
+  }
+
+  async start(
+    opts: { language?: string; glossary?: string; model?: string; gpuPack?: SttGpuPack | null } = {},
+  ): Promise<SidecarInfo> {
     if (this.info) return this.info
 
     const paths = sidecarPaths()
@@ -215,7 +245,16 @@ export class SttSidecar {
     // Путь — не при импорте модуля: папку userData main выставляет при запуске (appName.ts).
     const log = (this.log ??= new SttLog(join(app.getPath('userData'), 'logs', 'stt.log')))
     console.log('[stt] лог распознавания:', log.file)
-    log.write('app', [`запуск сайдкара: устройство ${device}, модель ${model.split(/[\\/]/).pop()}`])
+    const pack = opts.gpuPack ?? null
+    log.write('app', [
+      `запуск сайдкара: устройство ${device}, модель ${model.split(/[\\/]/).pop()}, ` +
+        `пакет Vulkan ${pack ? `установлен (${dirname(pack.helper)})` : 'не установлен'}`,
+    ])
+
+    // Пакет передаём, только если он установлен: без него сайдкар в auto выбирает между CUDA и процессором,
+    // как раньше. Кэш стартовой проверки видеокарты — рядом с логом: проверка стоит секунды, а её итог
+    // зависит только от устройства, драйвера, помощника и модели.
+    const packArgs = pack ? ['--vk-helper', pack.helper, '--ggml-model', pack.model, '--cache-dir', sttCacheDir()] : []
 
     const proc = spawn(
       python,
@@ -228,6 +267,7 @@ export class SttSidecar {
         '--device', DEVICES.has(device) ? device : 'auto',
         '--language', opts.language ?? 'ru',
         '--glossary', opts.glossary ?? '',
+        ...packArgs,
       ],
       { cwd: dir, windowsHide: true, env: sidecarEnv(paths.packaged) },
     )
@@ -274,6 +314,8 @@ export class SttSidecar {
             loopbackError?: string | null
             stats?: unknown
             event?: string
+            /** engine-fallback: почему ушли с видеокарты */
+            reason?: string
             error?: string
             fatal?: { code?: string; message?: string }
           }
@@ -298,8 +340,23 @@ export class SttSidecar {
               fallbackReason: msg.fallbackReason ?? null,
               loopbackDevice: msg.loopbackDevice ?? null,
               loopbackError: msg.loopbackError ?? null,
+              gpu: gateOfReady(msg),
             }
-            if (this.info.fallbackReason) console.warn('[stt] распознавание на процессоре:', this.info.fallbackReason)
+            const { gpu, fallbackReason } = this.info
+            if (gpu) {
+              // Итог проверки видеокарты — отдельной строкой: по жалобе «медленно» первым делом смотрят сюда.
+              const t = [gpu.tFullMs !== undefined && `полное окно ${Math.round(gpu.tFullMs)} мс`, gpu.tLadderMs !== undefined && `лесенка ${Math.round(gpu.tLadderMs)} мс`]
+                .filter(Boolean)
+                .join(', ')
+              log.write('app', [
+                `проверка видеокарты: ${gpu.device || 'устройство не названо'}, уровень ${gpu.tier}, flash attention ${gpu.flashAttn ? 'вкл' : 'выкл'}${t ? `, ${t}` : ''}${gpu.reason ? ` — ${gpu.reason}` : ''}`,
+              ])
+            }
+            if (device === 'vulkan') {
+              console.log('[stt] распознавание на видеокарте через Vulkan:', this.info.label, fallbackReason ? `(не CUDA: ${fallbackReason})` : '')
+            } else if (fallbackReason) {
+              console.warn(`[stt] распознавание ${device === 'cpu' ? 'на процессоре' : `на ${device}`}:`, fallbackReason)
+            }
             resolve(this.info)
           } else if (msg.fatal) {
             fatal = msg.fatal.message ?? msg.fatal.code ?? null
@@ -313,6 +370,23 @@ export class SttSidecar {
             // Закрытие сокета, замена подключения микрофона — то, что раньше
             // происходило молча и объясняло «перестал слышать мой голос».
             console.log('[stt] событие:', line)
+            // Переход с Vulkan на процессор. Сведения обновляем только о своём, ещё живом процессе:
+            // событие старого сайдкара после нового «Старт» не должно переписать новый.
+            if (msg.event === 'engine-fallback' && this.proc === proc && this.info && msg.device) {
+              const reason = msg.reason?.trim() || 'видеокарта через Vulkan сбоила'
+              const prev = this.info
+              this.info = {
+                ...prev,
+                device: msg.device,
+                label: msg.label || prev.label,
+                // Как у старта на процессоре: «почему не CUDA; Vulkan: почему не Vulkan».
+                fallbackReason: [prev.fallbackReason, `Vulkan: ${reason}`].filter(Boolean).join('; '),
+                gpu: gateAfterFallback(prev.gpu, reason),
+              }
+              log.write('app', [`распознавание перешло на ${msg.device === 'cpu' ? 'процессор' : msg.device} посреди сессии: ${reason}`])
+              console.warn('[stt] распознавание перешло на процессор посреди сессии:', reason)
+              this.onEngine?.(this.info, reason)
+            }
           } else if (msg.error) {
             console.error('[stt]', msg.error)
           }

@@ -52,6 +52,7 @@ import {
   Stop,
 } from './components/Icons'
 import { DEFAULT_SETTINGS, migrateSettings, type AppSettings } from '@shared/settings'
+import { GPU_HINT_TEXT, gpuHintWanted } from '@shared/gpuPack'
 import type { ContextFile } from '@shared/contextFiles'
 import { composeTerms, splitLines, topicLabel, type TopicGlossary } from '@shared/glossary'
 import type { OverlayStatus, Speaker } from '@shared/types'
@@ -147,6 +148,8 @@ const AFTERGLOW_MS = 2000
 const FLASH_MS = 380
 /** Сколько висит строка «провайдер не готов» после выбора его модели — как в макете. */
 const NOTICE_MS = 5000
+/** Подсказка про ускорение на видеокарте — дольше: её успевают прочитать и дотянуться до «Не показывать». */
+const GPU_HINT_MS = 30000
 /**
  * Черновик реплики, не менявшийся столько, уже не закроется: финал потерялся
  * вместе с сокетом или сайдкаром. Живой черновик меняется с каждой гипотезой,
@@ -840,6 +843,11 @@ export function App() {
 
   /* ---------- сессия ---------- */
 
+  /** Подсказка про пакет для AMD и Intel уже была в этом запуске: на каждом «Старт» она бы надоела. */
+  const gpuHintShown = useRef(false)
+  /** «Видеокарта сбоила — перешло на процессор»: про эту сессию, «Стоп» его снимает. */
+  const engineNotice = useRef<string | null>(null)
+
   const stop = useCallback(async () => {
     await micRef.current?.stop()
     micRef.current = null
@@ -855,9 +863,10 @@ export function App() {
     setDraft({ me: '', them: '' })
     // Отставание, переподключение и потерянный микрофон — про кончившуюся сессию;
     // прочие ошибки остаются.
-    const stale = [RECONNECTING, lagNotice.current, micFailure.current]
+    const stale = [RECONNECTING, lagNotice.current, micFailure.current, engineNotice.current]
     lagNotice.current = null
     micFailure.current = null
+    engineNotice.current = null
     backlog.current = new BacklogWatch()
     setError((e) => (e !== null && stale.includes(e) ? null : e))
     setLoopbackOk(false)
@@ -866,6 +875,9 @@ export function App() {
 
   const start = useCallback(async () => {
     setError(null)
+    // Подпись прошлой сессии не годится: движок выбирается заново (Vulkan после сбоя стартует процессором),
+    // и до готовности подпись честно говорит «модель загружается…».
+    setEngine(null)
     setPhase('starting')
     try {
       const res = await window.copilot.startStt({ language: settings.language })
@@ -898,6 +910,17 @@ export function App() {
       setMics(await listMicrophones())
       setPhase('running')
 
+      // Распознавание на процессоре, а рядом AMD или Intel без пакета — одна подсказка за запуск приложения,
+      // той же строкой, что и прочие уведомления. Ошибку старта она не перебивает.
+      if (!gpuHintShown.current && !settings.gpuHintHidden && res.info.device === 'cpu') {
+        void window.copilot.gpuPackState().then((g) => {
+          if (!gpuHintWanted(g, res.info.device, false) || gpuHintShown.current) return
+          gpuHintShown.current = true
+          setError((e) => e ?? GPU_HINT_TEXT)
+          window.setTimeout(() => setError((e) => (e === GPU_HINT_TEXT ? null : e)), GPU_HINT_MS)
+        })
+      }
+
       // Сессия Клода поднимается в фоне: стартовые секунды платим сейчас,
       // а не в момент, когда понадобится подсказка.
       warmNow.current()
@@ -911,6 +934,7 @@ export function App() {
   }, [
     settings.language,
     settings.micDeviceId,
+    settings.gpuHintHidden,
     settings.llmProvider,
     settings.llmModel,
     settings.llmThinking,
@@ -933,6 +957,25 @@ export function App() {
         void stop().then(() => setError(reason))
       }),
     [stop],
+  )
+
+  // Видеокарта через Vulkan сбоила или замедлилась посреди сессии — сайдкар уже на процессоре, расшифровка идёт.
+  // Подпись меняем сразу, а в строке уведомлений — одна фраза, чтобы замедление реплик не выглядело загадкой.
+  useEffect(
+    () =>
+      window.copilot.onSttEngine(({ label, device, reason }) => {
+        if (!sttRef.current) return
+        setEngine(label)
+        console.warn(`[stt] движок сменился посреди сессии: ${label} — ${reason}`)
+        if (device !== 'cpu') return
+        // Сторож скорости и авария — разные истории: «замедлилась» не пугает сбоем драйвера.
+        const what = /замедлил/i.test(reason) ? 'Видеокарта замедлилась' : 'Видеокарта сбоила'
+        const text = `${what} — распознавание перешло на процессор, реплики будут медленнее`
+        const prev = engineNotice.current
+        engineNotice.current = text
+        setError((e) => (e === null || e === prev || e === GPU_HINT_TEXT ? text : e))
+      }),
+    [],
   )
 
   const toggleSession = useCallback(() => {
@@ -2063,9 +2106,23 @@ export function App() {
         )}
 
         {error && (
-          <div className="error-line" role="alert">
-            <Alert size={14} />
+          // Подсказка про ускорение — не ошибка: та же строка, но без красной рамки и треугольника.
+          <div className={`error-line ${error === GPU_HINT_TEXT ? 'note' : ''}`} role={error === GPU_HINT_TEXT ? 'status' : 'alert'}>
+            {error === GPU_HINT_TEXT ? <Chip /> : <Alert size={14} />}
             <span>{error}</span>
+            {error === GPU_HINT_TEXT && (
+              <button
+                type="button"
+                className="btn-secondary xs"
+                style={{ marginLeft: 'auto' }}
+                onClick={() => {
+                  update('gpuHintHidden', true)
+                  setError((e) => (e === GPU_HINT_TEXT ? null : e))
+                }}
+              >
+                Не показывать
+              </button>
+            )}
           </div>
         )}
       </div>
