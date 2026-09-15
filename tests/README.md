@@ -11,7 +11,8 @@ Node 24 сам срезает типы TypeScript и запускает `.ts` к
 ## Что можно тестировать
 
 Только **чистые модули** — те, что не тянут electron и не выполняют ничего при импорте.
-Сейчас это `src/shared/*` и в main: `llm/types.ts`, `llm/queue.ts`, `llm/jsonrpc.ts`.
+Сейчас это `src/shared/*` и в main: `llm/types.ts`, `llm/queue.ts`, `llm/jsonrpc.ts`, `context/extract.ts`
+и `context/store.ts` (папку хранилищу передают снаружи, поэтому тест гоняет его на временной папке).
 Разбор протоколов CLI (строки JSONL → события) кладите в такие же чистые модули рядом с
 транспортом, например `src/main/llm/providers/codexProtocol.ts`, а процесс и electron —
 в сам адаптер. Тогда разбор проверяется здесь без запуска CLI.

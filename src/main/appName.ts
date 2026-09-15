@@ -14,6 +14,17 @@ export const AUTOSTART_ARGS = ['--hidden']
 
 /** Вызывать до готовности приложения и до первого обращения к userData. */
 export function keepLegacyUserData(): void {
+  // Для отладки — своя папка данных. По ней же Electron держит блокировку одной копии:
+  // проверочный запуск с другой папкой не отдаёт управление установленному приложению
+  // и не делит с ним настройки, журнал и хранилище окна.
+  const override = process.env.COPILOT_USER_DATA
+  if (override) {
+    app.setPath('userData', override)
+    return
+  }
+  // Папку, заданную явно (--user-data-dir), Electron уже взял — прежнее имя поверх неё молча вернуло бы
+  // запуск в данные установленного приложения, а с ними и в его блокировку одной копии.
+  if (app.commandLine.hasSwitch('user-data-dir')) return
   app.setPath('userData', join(app.getPath('appData'), LEGACY_NAME))
 }
 

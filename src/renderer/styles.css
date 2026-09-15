@@ -1562,6 +1562,36 @@ kbd {
 .record-actions .btn-danger { margin-left: auto; }
 .empty-card { padding: 24px 16px; border-radius: 12px; background: var(--ink-3); color: var(--text-2); font-size: 13px; text-align: center; text-wrap: pretty; }
 
+/* Файлы для контекста во вкладке «Свой промпт»: карточки записей, значки состояния и пустая карточка.
+   Своё здесь только одно — рамка цвета акцента, пока над блоком несут файлы: как у выбранного источника.
+   Рамке нужен зазор, иначе она легла бы на края карточек и на строку итога. Отрицательный отступ
+   забирает этот зазор из полей окна, и без перетаскивания блок стоит ровно там же, где стоял бы без него. */
+.ctx-drop { margin: -8px; padding: 8px; border-radius: 20px; transition: box-shadow .15s; }
+.ctx-drop.over { box-shadow: inset 0 0 0 2px var(--accent); }
+.ctx-main { display: grid; gap: 6px; min-width: 0; }
+/* Имя файла без пробелов («Резюме_Иванов_2026_финал.pdf») не должно растягивать окно вбок.
+   Переносится только имя: «PDF · 5 200 символов» держится справа в каждой карточке, как столбец. */
+.ctx-file .record-head { flex-wrap: nowrap; align-items: baseline; }
+.ctx-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.ctx-file .record-sum { flex: none; white-space: nowrap; }
+/* В широком окне переключатель и «Удалить» — справа от имени, как переключатели остальных настроек:
+   десять файлов иначе заняли бы два с половиной экрана. В узком — строкой под пометками. */
+.app:not(.compact) .ctx-file { grid-template-columns: minmax(0, 1fr) auto; column-gap: 16px; align-items: center; }
+.app:not(.compact) .ctx-file .record-actions { flex-wrap: nowrap; gap: 12px; margin-top: 0; }
+/* Причина отказа бывает длиннее строки: значок переносится, точка остаётся у первой строки. */
+.status-badge.ctx-note { align-items: flex-start; white-space: normal; text-wrap: pretty; }
+.status-badge.ctx-note i { flex: none; margin-top: 4px; }
+/* Ошибка — целое предложение, а красный на карточке не дотягивает до контраста текста 7:1:
+   цвет несёт квадратик, фраза — обычным текстом. */
+.status-badge.ctx-note.bad { color: var(--text); }
+.status-badge.ctx-note.bad i { background: var(--danger); }
+.ctx-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); cursor: pointer; }
+.ctx-toggle:has(.switch:disabled) { cursor: default; }
+.ctx-file.off .record-sum, .ctx-file.off .ctx-name { color: var(--text-2); }
+/* Итог переносится сам, а кнопка остаётся справа — как «Вернуть встроенный» над ним. */
+.ctx-drop .prompt-foot > span { flex: 1 1 260px; min-width: 0; text-wrap: pretty; }
+.ctx-drop .prompt-foot .btn-secondary { margin-left: auto; }
+
 .info-list { display: grid; gap: 10px; max-width: 68ch; padding-top: 6px; font-size: 13px; line-height: 1.5; text-wrap: pretty; }
 .info-lead { font-size: 14px; font-weight: 600; }
 .info-item { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; padding: 10px 12px; border-radius: 12px; background: var(--ink-3); }

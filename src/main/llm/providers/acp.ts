@@ -554,7 +554,7 @@ class AcpSession implements LlmSession {
   }
 
   private get system(): string {
-    return suggestSystemPrompt(this.cfg.systemPrompt)
+    return suggestSystemPrompt(this.cfg.systemPrompt, false, this.cfg.context)
   }
 
   /**
@@ -628,7 +628,7 @@ class AcpSession implements LlmSession {
     try {
       conn = await this.connection()
       if (gen !== this.gen) return
-      // Свой промпт поменялся, а прежний уже в сессии: промпт живёт в истории сессии, нужна новая.
+      // Свой промпт или файлы контекста поменялись, а прежний промпт уже в сессии: он живёт в её истории, нужна новая.
       if (this.sentSystem !== null && this.sentSystem !== this.system) {
         await conn.newSession(true)
         await conn.readOnly()

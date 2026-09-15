@@ -12,6 +12,8 @@ import { Alert, Check, Close, Duo, EyeOff } from './Icons'
 import { Dropdown, Seg, Switch, type Option } from './Controls'
 import { Mascot } from './Mascot'
 import { ProviderSetup, type ProvidersCtl } from './ProviderPicker'
+import { ContextFiles } from './ContextFiles'
+import type { ContextFile } from '@shared/contextFiles'
 import { chipOf, isReady, noteOf, promptReachesModel, verifyDepthNote, verifyEffortsOf, viaOf } from '../providerStatus'
 
 type Tab = 'general' | 'prompt' | 'glossary' | 'records' | 'account' | 'hotkeys' | 'guide'
@@ -30,6 +32,8 @@ interface Props {
   /** кто может отвечать: состояние, живые списки моделей, вход и повторная проверка */
   providers: ProvidersCtl
   onChange: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => void
+  /** правка списка файлов для контекста — от свежего списка: добавление приходит из main не сразу */
+  onContextFiles: (edit: (files: ContextFile[]) => ContextFile[]) => void
   /** сменить провайдера — вместе с его последней моделью */
   onPickProvider: (id: ProviderId) => void
   /** модель текущего провайдера */
@@ -221,6 +225,7 @@ export function Settings({
   hotkeys,
   providers,
   onChange,
+  onContextFiles,
   onPickProvider,
   onPickModel,
   onPickVerifyProvider,
@@ -655,6 +660,17 @@ export function Settings({
                   desc="Без этого панель попадёт в демонстрацию экрана и в запись созвона. В строке состояния появится «виден в захвате»."
                 />
                 <Row
+                  name="Спрятать из трея"
+                  control={
+                    <Switch
+                      on={settings.hideTray}
+                      label="Спрятать из трея"
+                      onClick={() => onChange('hideTray', !settings.hideTray)}
+                    />
+                  }
+                  desc={`Значка Подсказыча не будет рядом с часами. ${hideText ? `Панель прячется и возвращается клавишами ${hideText}, а если` : 'Если'} запустить Подсказыч ещё раз, откроется уже запущенный. Если клики идут сквозь панель или она спрятана, а клавиши для этого нет, значок вернётся сам — иначе приложением было бы нечем управлять.`}
+                />
+                <Row
                   last
                   name="Распознавание речи"
                   control={
@@ -703,6 +719,14 @@ export function Settings({
                     Вернуть встроенный
                   </button>
                 </div>
+
+                {/* Файлы работают и со встроенным промптом, и со своим — поэтому блок под обоими. */}
+                <h3 className="section-title">Файлы для контекста</h3>
+                <p className="muted-p">
+                  Резюме, описание проекта, вакансия — текст из файлов модель учтёт в подсказках. Файлы остаются на
+                  компьютере, в запрос уходит только их текст.
+                </p>
+                <ContextFiles files={settings.contextFiles} onEdit={onContextFiles} />
               </>
             )}
 
@@ -907,8 +931,9 @@ export function Settings({
                 <div className="info-item">
                   <i style={{ background: 'var(--them)' }} />
                   <span>
-                    <strong>Уходит в сеть:</strong> только текст запроса к модели — расшифровка, ваш вопрос и
-                    найденное в базе. И запрос ко второму агенту, если режим двух агентов включён.
+                    <strong>Уходит в сеть:</strong> только текст запроса к модели — расшифровка, ваш вопрос,
+                    найденное в базе и текст прикреплённых файлов контекста. И запрос ко второму агенту, если режим
+                    двух агентов включён.
                   </span>
                 </div>
                 <div className="info-item">

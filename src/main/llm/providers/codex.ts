@@ -673,7 +673,7 @@ class CodexSession implements LlmSession {
   }
 
   private instructions(): string {
-    return suggestSystemPrompt(this.cfg.systemPrompt)
+    return suggestSystemPrompt(this.cfg.systemPrompt, false, this.cfg.context)
   }
 
   private async ensureThread(server: AppServer): Promise<string> {

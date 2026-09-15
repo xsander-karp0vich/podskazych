@@ -13,6 +13,7 @@ import {
   loadBody,
   ollamaBaseUrl,
   ollamaErrorText,
+  ollamaNumCtx,
   ollamaUnreachable,
   parseChatLine,
   parseShow,
@@ -115,6 +116,18 @@ test('ollama: тело /api/chat — системное сообщение, ка
   assert.ok(!('think' in body))
   assert.equal(chatBody({ model: 'm', system: 's', text: 't', think: false }).think, false, 'false тоже передаётся')
   assert.deepEqual(loadBody('m'), { model: 'm', messages: [] })
+})
+
+test('ollama: окно контекста — только под длинный промпт, одно и то же у прогрева и вопроса', () => {
+  assert.equal(ollamaNumCtx(700), undefined, 'встроенный промпт: поле не передаём, всё как раньше')
+  assert.equal(ollamaNumCtx(2048), undefined)
+  // 60 000 символов файлов и встроенный промпт: ~30 тысяч токенов и запас на вопрос.
+  const n = ollamaNumCtx(60_700)!
+  assert.ok(n >= Math.ceil(60_700 / 2) + 4096 && n % 4096 === 0, String(n))
+  assert.equal(ollamaNumCtx(10_000_000), 65_536, 'потолок')
+  assert.deepEqual(chatBody({ model: 'm', system: 's', text: 't', numCtx: n }).options, { num_ctx: n })
+  assert.equal(chatBody({ model: 'm', system: 's', text: 't' }).options, undefined)
+  assert.deepEqual(loadBody('m', '20m', n), { model: 'm', messages: [], keep_alive: '20m', options: { num_ctx: n } })
 })
 
 test('ollama: поток NDJSON — строка может порваться между кусками', () => {

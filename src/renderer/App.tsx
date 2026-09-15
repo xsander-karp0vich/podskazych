@@ -52,6 +52,7 @@ import {
   Stop,
 } from './components/Icons'
 import { DEFAULT_SETTINGS, migrateSettings, type AppSettings } from '@shared/settings'
+import type { ContextFile } from '@shared/contextFiles'
 import { composeTerms, splitLines, topicLabel, type TopicGlossary } from '@shared/glossary'
 import type { OverlayStatus, Speaker } from '@shared/types'
 import type { KbHit, LlmTarget } from '../preload'
@@ -72,18 +73,25 @@ function llmTarget(s: AppSettings): LlmTarget {
     model: s.llmModel,
     thinking: s.llmThinking,
     effort: s.llmProvider === 'claude' ? s.llmEffort : 'default',
+    // Только включённые и с текстом: скан без текстового слоя менял бы промпт пустым местом.
+    contextFiles: s.contextFiles.filter((f) => f.enabled && f.chars > 0).map((f) => ({ id: f.id, name: f.name })),
   }
 }
 
-function loadSettings(): AppSettings {
+/**
+ * Настройки при запуске. stored — они правда прочитаны из хранилища, а не взяты по умолчанию:
+ * пустой список файлов по умолчанию не значит «файлов нет» — хранилище могло не открыться
+ * (вторая копия приложения, сбой чтения), и уборка по такому списку стёрла бы все тексты.
+ */
+function loadSettings(): { settings: AppSettings; stored: boolean } {
   try {
     const raw = localStorage.getItem(STORE_KEY)
-    if (!raw) return DEFAULT_SETTINGS
+    if (!raw) return { settings: DEFAULT_SETTINGS, stored: false }
     // Старые настройки — в нынешний вид: источник 'claude-code' | 'api' стал провайдером и
     // способом обращения к Claude, модели-псевдонимы «opus / sonnet / haiku» — точными id.
-    return migrateSettings(JSON.parse(raw))
+    return { settings: migrateSettings(JSON.parse(raw)), stored: true }
   } catch {
-    return DEFAULT_SETTINGS
+    return { settings: DEFAULT_SETTINGS, stored: false }
   }
 }
 
@@ -280,7 +288,8 @@ function TrLine({ speaker, text, draft }: { speaker: Speaker; text: string; draf
 }
 
 export function App() {
-  const [settings, setSettings] = useState<AppSettings>(loadSettings)
+  const [boot] = useState(loadSettings)
+  const [settings, setSettings] = useState<AppSettings>(boot.settings)
   const [status, setStatus] = useState<OverlayStatus | null>(null)
   const [phase, setPhase] = useState<'idle' | 'starting' | 'running'>('idle')
   const [error, setError] = useState<string | null>(null)
@@ -451,10 +460,14 @@ export function App() {
 
   /* ---------- настройки ---------- */
 
-  /** Несколько настроек разом: провайдер и его модель меняются только вместе. */
-  const patch = useCallback((changes: Partial<AppSettings>) => {
+  /**
+   * Несколько настроек разом: провайдер и его модель меняются только вместе.
+   * Функцией — от свежих настроек: файл, прочитанный за пару секунд, не должен затереть
+   * переключатель, который успели щёлкнуть, пока он читался.
+   */
+  const patch = useCallback((changes: Partial<AppSettings> | ((prev: AppSettings) => Partial<AppSettings>)) => {
     setSettings((prev) => {
-      const next = { ...prev, ...changes }
+      const next = { ...prev, ...(typeof changes === 'function' ? changes(prev) : changes) }
       try {
         localStorage.setItem(STORE_KEY, JSON.stringify(next))
       } catch {
@@ -468,6 +481,20 @@ export function App() {
     <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => patch({ [key]: value } as Partial<AppSettings>),
     [patch],
   )
+
+  /** Список файлов для контекста — правкой от свежего списка: добавление приходит из main асинхронно. */
+  const editContextFiles = useCallback(
+    (edit: (files: ContextFile[]) => ContextFile[]) => patch((prev) => ({ contextFiles: edit(prev.contextFiles) })),
+    [patch],
+  )
+
+  // Тексты файлов, которых нет в списке, — с диска: настройки сбросили, а файлы остались бы навсегда.
+  // Один раз при запуске: позже список меняется только через окно, и тексты убираются вместе со строками.
+  // Только по списку из хранилища: по умолчательному пустому ушли бы тексты, которые список ещё помнит.
+  // Настоящий сброс настроек уберётся при следующем запуске — после первой же сохранённой правки.
+  useEffect(() => {
+    if (boot.stored) void window.copilot.pruneContextFiles(boot.settings.contextFiles.map((f) => f.id))
+  }, [])
 
   /**
    * Отвечать этим провайдером и этой моделью. Выбор запоминается за провайдером:
@@ -552,6 +579,11 @@ export function App() {
   useEffect(() => {
     void window.copilot.setContentProtection(settings.contentProtected)
   }, [settings.contentProtected])
+
+  // И при загрузке тоже: main при запуске берёт настройку из своей копии, а правда — здесь.
+  useEffect(() => {
+    void window.copilot.setHideTray(settings.hideTray)
+  }, [settings.hideTray])
 
   useEffect(() => {
     void window.copilot.setZoom(settings.zoom)
@@ -2097,6 +2129,7 @@ export function App() {
           onChange={update}
           clickThrough={clickThrough}
           clickThroughKeys={throughKeys}
+          hideKeys={comboKeys(hotkeyCombo(status?.hotkeys, 'hide'))}
           onClickThrough={() => {
             setMenuOpen(false)
             // Не выставляем режим сами: панель переключится, когда main подтвердит смену окна.
@@ -2124,6 +2157,7 @@ export function App() {
           hotkeys={status?.hotkeys}
           providers={providers}
           onChange={update}
+          onContextFiles={editContextFiles}
           onPickProvider={switchProvider}
           onPickModel={(m) => choose(settings.llmProvider, m)}
           onPickVerifyProvider={switchVerifier}

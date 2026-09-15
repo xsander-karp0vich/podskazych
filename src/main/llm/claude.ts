@@ -19,6 +19,8 @@ export interface SuggestParams {
    * модели не нужно ходить за ним самой. Меняется на каждом вопросе, поэтому идёт ПОСЛЕ точки кэша.
    */
   transcript: string
+  /** блок материалов пользователя к системному промпту; пусто — файлов нет */
+  context?: string
   onText: (delta: string) => void
   signal?: AbortSignal
 }
@@ -46,6 +48,8 @@ export interface ScreenParams {
   question: string
   /** последние реплики: без них модель не понимает, к чему вопрос */
   transcript: string
+  /** блок материалов пользователя: решение по снимку тоже пишется от лица пользователя */
+  context?: string
   onText: (delta: string) => void
   signal?: AbortSignal
 }
@@ -121,7 +125,7 @@ export class ClaudeSuggester {
         // Решение задачи со снимка — несколько кусков кода с пояснениями: 1024 токенов на него не хватало.
         max_tokens: 4096,
         output_config: { effort: 'low' },
-        system: SCREEN_SYSTEM,
+        system: SCREEN_SYSTEM + (p.context ?? ''),
         messages: [
           {
             role: 'user',
@@ -157,7 +161,10 @@ export class ClaudeSuggester {
 
   async suggest(p: SuggestParams): Promise<string> {
     // Точка кэша — на системном промпте: он одинаковый у всех вопросов созвона.
-    const system: Anthropic.TextBlockParam[] = [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }]
+    // Материалы пользователя — внутри кэшируемой части: они тоже не меняются от вопроса к вопросу.
+    const system: Anthropic.TextBlockParam[] = [
+      { type: 'text', text: SYSTEM + (p.context ?? ''), cache_control: { type: 'ephemeral' } },
+    ]
 
     const stream = this.client.messages.stream(
       {

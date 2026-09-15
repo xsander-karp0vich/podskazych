@@ -45,6 +45,7 @@ class ClaudeCliSession implements LlmSession {
     // второму агенту — веб-поиск по его настройке.
     if (cfg.web !== undefined) this.s.setTools(cfg.web ? ['WebSearch', 'WebFetch'] : undefined)
     this.s.setSystemPrompt(cfg.systemPrompt)
+    this.s.setContext(cfg.context)
   }
 
   warmup(): Promise<void> {
@@ -76,13 +77,16 @@ class ClaudeCliSession implements LlmSession {
 /**
  * API по ключу. Модель, размышления и свой промпт он не учитывает — как и раньше:
  * промпт и модель там зашиты в ClaudeSuggester. Очереди нет: запросы независимы.
+ * Файлы контекста — учитывает: это данные, а не инструкция, и дописываются к зашитому промпту.
  */
 class ClaudeApiSession implements LlmSession {
   private suggester: ClaudeSuggester | null = null
   private running = 0
+  private context = ''
 
-  configure(): void {
-    /* настройки сессии API не использует */
+  configure(cfg: SessionConfig): void {
+    // Из настроек сессии API берёт только материалы пользователя: сессии у него нет, блок уходит в каждый запрос.
+    this.context = cfg.context ?? ''
   }
 
   async warmup(): Promise<void> {
@@ -108,11 +112,12 @@ class ClaudeApiSession implements LlmSession {
           intro: input.screen.intro,
           question: input.screen.question,
           transcript: input.screen.transcript,
+          context: this.context,
           onText: (d) => h.onDelta(d),
         })
       }
       // Найденное в базе уже стоит в начале текста — модели не нужно ходить за ним самой.
-      return await this.suggester.suggest({ transcript: input.text, onText: (d) => h.onDelta(d) })
+      return await this.suggester.suggest({ transcript: input.text, context: this.context, onText: (d) => h.onDelta(d) })
     } finally {
       this.running--
     }

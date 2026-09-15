@@ -5,6 +5,7 @@ import type { OverlayStatus } from '@shared/types'
 import type { LlmErrorKind } from '../main/llm/types'
 import type { ProviderStatus } from '../main/llm/registry'
 import type { TopicGlossary } from '@shared/glossary'
+import type { ContextFile } from '@shared/contextFiles'
 
 export interface KbHit {
   uid: string
@@ -78,6 +79,16 @@ export interface LlmTarget {
   model?: string
   thinking?: boolean
   effort?: EffortChoice
+  /** включённые файлы для контекста по порядку списка: main соберёт из их текста блок промпта */
+  contextFiles?: Array<{ id: string; name: string }>
+}
+
+/** Итог добавления файлов для контекста: что легло в список и что не прочиталось. */
+export interface ContextAddResult {
+  added: ContextFile[]
+  failed: Array<{ name: string; error: string }>
+  /** диалог закрыли, ничего не выбрав */
+  canceled?: true
 }
 
 export type EffortChoice = 'default' | Effort
@@ -149,6 +160,11 @@ const api = {
   getClickThrough: (): Promise<boolean> => ipcRenderer.invoke('window:getClickThrough'),
   setOpacity: (v: number): Promise<void> => ipcRenderer.invoke('window:setOpacity', v),
   setContentProtection: (v: boolean): Promise<void> => ipcRenderer.invoke('window:setContentProtection', v),
+  /**
+   * «Спрятать из трея». Настройка — в окне, main держит её копию к следующему запуску и сам
+   * возвращает значок, пока без него приложением не управлять.
+   */
+  setHideTray: (v: boolean): Promise<void> => ipcRenderer.invoke('window:setHideTray', v),
   quit: (): Promise<void> => ipcRenderer.invoke('app:quit'),
   copyText: (text: string): Promise<void> => ipcRenderer.invoke('clipboard:write', text),
 
@@ -171,6 +187,18 @@ const api = {
     format: 'md' | 'json',
   ): Promise<{ ok: true; path: string } | { ok: false; canceled?: true; error?: string }> =>
     ipcRenderer.invoke('journal:export', { id, format }),
+
+  // файлы для контекста: список и флаги — в настройках окна, текст — в main
+  /** Выбрать файлы системным диалогом; have — сколько уже в списке. */
+  pickContextFiles: (have: number): Promise<ContextAddResult> => ipcRenderer.invoke('context:pick', have),
+  /** Перетащенные файлы: имя и байты — путь к файлу окну недоступен. */
+  addContextFiles: (files: Array<{ name: string; data: Uint8Array }>, have: number): Promise<ContextAddResult> =>
+    ipcRenderer.invoke('context:addBuffers', { files, have }),
+  removeContextFile: (id: string): Promise<void> => ipcRenderer.invoke('context:remove', id),
+  /** id файлов, чей текст пропал с диска. */
+  missingContextFiles: (ids: string[]): Promise<string[]> => ipcRenderer.invoke('context:missing', ids),
+  /** Удалить тексты файлов, которых нет в списке. */
+  pruneContextFiles: (keep: string[]): Promise<number> => ipcRenderer.invoke('context:prune', keep),
 
   // распознавание
   startStt: (opts: { language?: string; glossary?: string }): Promise<SttStartResult> =>

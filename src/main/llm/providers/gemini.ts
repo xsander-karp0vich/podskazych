@@ -192,7 +192,7 @@ class GeminiSession implements LlmSession {
   }
 
   private systemPrompt(): string {
-    return suggestSystemPrompt(this.cfg.systemPrompt)
+    return suggestSystemPrompt(this.cfg.systemPrompt, false, this.cfg.context)
   }
 
   private launchKey(): string {

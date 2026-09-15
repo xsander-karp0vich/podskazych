@@ -111,6 +111,8 @@ function noMcpConfigPath(): string {
 export class ClaudeCodeSuggester {
   private proc: ChildProcess | null = null
   private system: string | undefined
+  /** блок из текста прикреплённых файлов; пусто — файлов нет или это второй агент */
+  private context = ''
   private model: string | undefined
   private thinking = true
   /** Усилие в режиме «думает»; undefined — по умолчанию CLI. «Сразу» всегда low. */
@@ -134,6 +136,13 @@ export class ClaudeCodeSuggester {
     // Промпт задаётся первым сообщением, поэтому смена требует новой сессии.
     this.reconfigure(() => {
       this.system = prompt?.trim() || undefined
+    })
+  }
+
+  /** Материалы пользователя к системному промпту: тоже уходят первым сообщением, смена — новая сессия. */
+  setContext(block: string | undefined): void {
+    this.reconfigure(() => {
+      this.context = block ?? ''
     })
   }
 
@@ -170,7 +179,7 @@ export class ClaudeCodeSuggester {
 
   /** Всё, с чем запускается процесс и открывается сессия. */
   private launchKey(): string {
-    return JSON.stringify([this.model, this.effectiveEffort, this.tools, this.isHaiku && !this.thinking, this.system])
+    return JSON.stringify([this.model, this.effectiveEffort, this.tools, this.isHaiku && !this.thinking, this.system, this.context])
   }
 
   /**
@@ -398,7 +407,7 @@ export class ClaudeCodeSuggester {
 
   private write({ text, images = [] }: Question): void {
     // Системный промпт идёт вместе с первым сообщением сессии.
-    const system = this.system ?? SUGGEST_SYSTEM + (this.isHaiku && !this.thinking ? NO_THINKING_RULE : '')
+    const system = (this.system ?? SUGGEST_SYSTEM + (this.isHaiku && !this.thinking ? NO_THINKING_RULE : '')) + this.context
     const first = !this.systemSent
     this.systemSent = true
     // Порядок: системный промпт, картинки, вопрос. Вопрос ссылается на снимки «выше» — если они

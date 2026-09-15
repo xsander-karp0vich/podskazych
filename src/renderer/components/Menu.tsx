@@ -13,6 +13,8 @@ interface Props {
   clickThrough: boolean
   /** клавиши выхода из режима; пусто — комбинацию занять не удалось, выход только через трей */
   clickThroughKeys: string[]
+  /** клавиши «Скрыть панель», они же возвращают её; пусто — комбинацию занять не удалось */
+  hideKeys: string[]
   onClickThrough: () => void
   /** показать обучение заново */
   onOpenTour: () => void
@@ -21,7 +23,7 @@ interface Props {
   onClose: () => void
 }
 
-type Flag = 'contentProtected' | 'showTranscript' | 'useKnowledgeBase' | 'autoSuggest'
+type Flag = 'contentProtected' | 'hideTray' | 'showTranscript' | 'useKnowledgeBase' | 'autoSuggest'
 
 /**
  * Меню из гамбургера. Стоит внутри окна и не выше его: max-height —
@@ -35,6 +37,7 @@ export function Menu({
   onChange,
   clickThrough,
   clickThroughKeys,
+  hideKeys,
   onClickThrough,
   onOpenTour,
   onOpenSettings,
@@ -220,6 +223,19 @@ export function Menu({
             ? 'панели не видно в демонстрации, записи и на скриншотах'
             : 'сейчас панель видна в демонстрации экрана и в записи',
         )}
+        {/* Рядом со скрытием от захвата: оба про то, чтобы Подсказыча не было видно. Без значка у панели
+            нет ни трея, ни панели задач, поэтому подпись сразу говорит, как её вернуть. */}
+        {flag(
+          'hideTray',
+          'Спрятать из трея',
+          // Клавиши — через неразрывный пробел: комбинация не должна рваться между строками.
+          // Подпись короткая, в две строки, как у соседних.
+          settings.hideTray
+            ? hideKeys.length
+              ? `значка нет в трее · вернуть: ${hideKeys.join(' ')} или новый запуск`
+              : 'значка нет в трее · вернуть: запустите Подсказыч снова'
+            : 'значок в трее рядом с часами',
+        )}
         {/* Режим держит main: строка не переключает его сама, а просит — и закрывает меню,
             потому что в этом режиме по меню уже не кликнуть. Выход — клавишами или из трея. */}
         <button
@@ -233,7 +249,7 @@ export function Menu({
             <span className="label">Клики сквозь окно</span>
             <span className="sub">
               клики уходят в окно под панелью · выйти{' '}
-              {clickThroughKeys.length ? clickThroughKeys.join(' ') : 'через трей'}
+              {clickThroughKeys.length ? clickThroughKeys.join(' ') : 'через трей'}
             </span>
           </span>
           <SwitchMark on={clickThrough} />

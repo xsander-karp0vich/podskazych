@@ -173,3 +173,19 @@ test('миграция: повторная миграция ничего не м
     assert.deepEqual(migrateSettings(JSON.parse(JSON.stringify(once))), once)
   }
 })
+
+test('миграция: «Спрятать из трея» — выключено у старых настроек и у битых значений', () => {
+  // Настройки до появления переключателя: значок остаётся на месте.
+  assert.equal(migrateSettings({ llmProvider: 'claude-code', fontSize: 20 }).hideTray, false)
+  assert.equal(migrateSettings(undefined).hideTray, false)
+  assert.equal(DEFAULT_SETTINGS.hideTray, false)
+  // Спрятать значок по мусору — оставить приложение без запасного выхода: только строгое true.
+  for (const hideTray of ['true', 1, 'да', null, {}, []]) {
+    assert.equal(migrateSettings({ hideTray }).hideTray, false, JSON.stringify(hideTray))
+  }
+  assert.equal(migrateSettings({ hideTray: true }).hideTray, true)
+  assert.equal(migrateSettings({ hideTray: false }).hideTray, false)
+  const once = migrateSettings({ hideTray: true, contentProtected: false })
+  assert.deepEqual(migrateSettings(JSON.parse(JSON.stringify(once))), once)
+  assert.equal(once.contentProtected, false, 'соседнюю настройку не трогаем')
+})

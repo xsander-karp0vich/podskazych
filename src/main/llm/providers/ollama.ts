@@ -28,6 +28,7 @@ import {
   loadBody,
   ollamaBaseUrl,
   ollamaErrorText,
+  ollamaNumCtx,
   ollamaUnreachable,
   parseChatLine,
   parseShow,
@@ -211,7 +212,8 @@ class OllamaSession implements LlmSession {
   /** Растёт при каждом обрыве: события старого запроса после этого игнорируются. */
   private seq = 0
   private ctrl: AbortController | null = null
-  private warm: { model: string; at: number } | null = null
+  /** что прогрето: модель и окно контекста — другое окно Ollama загрузит заново */
+  private warm: { model: string; numCtx: number | undefined; at: number } | null = null
   private warming: Promise<void> | null = null
 
   constructor(catalog: OllamaCatalog) {
@@ -246,12 +248,14 @@ class OllamaSession implements LlmSession {
   warmup(): Promise<void> {
     const model = this.model()
     if (!model) return Promise.resolve()
-    if (this.warm?.model === model && Date.now() - this.warm.at < WARM_TTL_MS) return Promise.resolve()
+    // Окно — как у вопросов: прогрев с другим num_ctx ничего бы не дал, первый вопрос загрузил бы модель снова.
+    const numCtx = ollamaNumCtx(this.system().length)
+    if (this.warm?.model === model && this.warm.numCtx === numCtx && Date.now() - this.warm.at < WARM_TTL_MS) return Promise.resolve()
     this.warming ??= (async () => {
       try {
         void this.catalog.info(model)
-        const r = await requestJson('POST', '/api/chat', loadBody(model, keepAlive()), 180_000)
-        if (r.status === 200) this.warm = { model, at: Date.now() }
+        const r = await requestJson('POST', '/api/chat', loadBody(model, keepAlive(), numCtx), 180_000)
+        if (r.status === 200) this.warm = { model, numCtx, at: Date.now() }
       } catch {
         /* не прогрелась — первый вопрос загрузит модель сам */
       } finally {
@@ -275,7 +279,7 @@ class OllamaSession implements LlmSession {
 
   private system(): string {
     // «Не рассуждай» — в режиме «сразу»: небольшие локальные модели без него рассуждают прямо в ответе.
-    return suggestSystemPrompt(this.cfg.systemPrompt, !this.cfg.thinking)
+    return suggestSystemPrompt(this.cfg.systemPrompt, !this.cfg.thinking, this.cfg.context)
   }
 
   private async send(input: TurnInput): Promise<void> {
@@ -294,13 +298,16 @@ class OllamaSession implements LlmSession {
       if (input.images?.length && info.capabilities && !info.capabilities.includes('vision')) {
         throw new LlmError('images-unsupported', 'ollama', ollamaErrorText('images-unsupported', '', model))
       }
+      const system = this.system()
       const body = chatBody({
         model,
-        system: this.system(),
+        system,
         text: input.text,
         images: input.images,
         think: thinkValue(model, info, this.cfg.thinking, this.cfg.effort),
         keepAlive: keepAlive(),
+        // Блок файлов для контекста не влез бы в окно Ollama по умолчанию и был бы молча обрезан.
+        numCtx: ollamaNumCtx(system.length),
       })
       let res: http.IncomingMessage
       try {

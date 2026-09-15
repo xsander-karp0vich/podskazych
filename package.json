@@ -1,6 +1,6 @@
 {
   "name": "call-copilot",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Личный ассистент для созвонов и демо: локальный транскрипт и подсказки из встроенной базы вопросов",
   "main": "out/main/index.js",
   "private": true,
@@ -36,7 +36,8 @@
     "@anthropic-ai/sdk": "^0.124.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "undici": "^8.10.2"
+    "undici": "^8.10.2",
+    "unpdf": "1.8.1"
   },
   "productName": "Подсказыч",
   "build": {

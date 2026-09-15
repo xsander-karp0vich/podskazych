@@ -257,6 +257,31 @@ export function thinkValue(
   return 'medium'
 }
 
+/* ---------- окно контекста ---------- */
+
+/** Системный промпт до этого размера (в оценке токенов) влезает в окно Ollama по умолчанию вместе с вопросом. */
+export const OLLAMA_PLAIN_PROMPT_TOKENS = 1024
+/** Запас на вопрос: расшифровка, найденное в базе и сам ответ. */
+export const OLLAMA_QUESTION_RESERVE = 4096
+/** Потолок: дальше память под кэш модели растёт быстрее пользы, а блок файлов столько и не занимает. */
+export const OLLAMA_MAX_CTX = 65_536
+
+/**
+ * num_ctx под длинный системный промпт — обычно под блок файлов для контекста. Окно Ollama по
+ * умолчанию — несколько тысяч токенов, и лишнее сервер молча отрезает: пропали бы правила или
+ * половина резюме, а окно настроек обещало бы, что всё уходит. Токен кириллицы — около двух-трёх
+ * знаков, поэтому считаем по два: лишняя память лучше обрезанного промпта.
+ *
+ * Короткий промпт — undefined: поле не передаём, и всё как раньше, без перезагрузки модели.
+ * Значение кратно 4096 и зависит только от промпта: прогрев и вопросы шлют одно и то же, иначе
+ * Ollama перезагружала бы модель на каждом переходе. Больше, чем обучена модель, Ollama сама не даст.
+ */
+export function ollamaNumCtx(systemChars: number): number | undefined {
+  const tokens = Math.ceil(systemChars / 2)
+  if (tokens <= OLLAMA_PLAIN_PROMPT_TOKENS) return undefined
+  return Math.min(OLLAMA_MAX_CTX, Math.ceil((tokens + OLLAMA_QUESTION_RESERVE) / 4096) * 4096)
+}
+
 export interface ChatBodyInput {
   model: string
   system: string
@@ -264,6 +289,8 @@ export interface ChatBodyInput {
   images?: ImageInput[]
   think?: ThinkValue
   keepAlive?: string
+  /** окно контекста (ollamaNumCtx); нет — как настроено в Ollama */
+  numCtx?: number
 }
 
 /**
@@ -281,12 +308,16 @@ export function chatBody(i: ChatBodyInput): Record<string, unknown> {
   }
   if (i.think !== undefined) body.think = i.think
   if (i.keepAlive) body.keep_alive = i.keepAlive
+  if (i.numCtx) body.options = { num_ctx: i.numCtx }
   return body
 }
 
-/** Тело прогрева: пустой messages — только загрузить модель. */
-export function loadBody(model: string, keepAlive?: string): Record<string, unknown> {
-  return keepAlive ? { model, messages: [], keep_alive: keepAlive } : { model, messages: [] }
+/** Тело прогрева: пустой messages — только загрузить модель. numCtx — тот же, что у вопросов. */
+export function loadBody(model: string, keepAlive?: string, numCtx?: number): Record<string, unknown> {
+  const body: Record<string, unknown> = { model, messages: [] }
+  if (keepAlive) body.keep_alive = keepAlive
+  if (numCtx) body.options = { num_ctx: numCtx }
+  return body
 }
 
 /* ---------- поток ---------- */

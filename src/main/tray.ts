@@ -3,10 +3,23 @@ import { join } from 'node:path'
 import type { ClickThrough } from './clickThrough'
 import { AUTOSTART_ARGS } from './appName'
 
+/** Значок в трее и всё, что на него подписано. */
+export interface TrayHandle {
+  /** пересобрать меню: панель показали или спрятали мимо трея — клавишей или повторным запуском */
+  refresh(): void
+  /**
+   * Убрать значок и снять подписку на режим. Значок прячут и возвращают на лету, пересоздавая
+   * трей, — брошенная подписка копилась бы с каждым разом и пересобирала меню мёртвого значка.
+   */
+  destroy(): void
+}
+
 /**
  * Оверлей намеренно живёт без панели задач и без рамки окна (skipTaskbar,
  * frame:false), поэтому трей — единственное место, где приложением можно
  * управлять: показать, спрятать, выйти. Без него его нечем закрыть.
+ * Спрятать значок можно («Спрятать из трея»), но тогда main возвращает его сам,
+ * пока без него управлять нечем, — см. trayVisibility.
  */
 export function createTray(
   win: BrowserWindow,
@@ -17,7 +30,7 @@ export function createTray(
     /** комбинация, которая переключает режим, — подсказкой в пункте меню */
     clickThroughCombo?: string | null
   } = {},
-): Tray {
+): TrayHandle {
   // createFromPath подхватывает и соседние tray@1.25x…@3x.png — трей на high-DPI берёт
   // свой размер. Базовый tray.png (16 px) нарисован по отдельной сетке 8×8.
   const iconPath = app.isPackaged
@@ -27,7 +40,9 @@ export function createTray(
   const icon = nativeImage.createFromPath(iconPath)
   const tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon)
 
-  let contentProtected = true
+  // С окна, а не «включено»: трей пересоздают, когда значок возвращается, и галочка
+  // не должна откатываться к умолчанию, пока окно уже видно в захвате.
+  let contentProtected = win.isContentProtected()
   const through = opts.clickThrough
 
   const rebuild = () => {
@@ -101,12 +116,19 @@ export function createTray(
 
   rebuild()
   // Режим меняют и хоткей, и меню панели — галочка и подсказка у значка догоняют по подписке.
-  through?.subscribe(() => rebuild())
+  const unsubscribe = through?.subscribe(() => rebuild())
+  // Обработчик живёт на самом значке и уходит вместе с ним.
   tray.on('double-click', () => {
     if (win.isVisible()) win.hide()
     else win.show()
     rebuild()
   })
 
-  return tray
+  return {
+    refresh: rebuild,
+    destroy: () => {
+      unsubscribe?.()
+      if (!tray.isDestroyed()) tray.destroy()
+    },
+  }
 }

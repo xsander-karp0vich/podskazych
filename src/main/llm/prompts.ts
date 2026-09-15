@@ -41,7 +41,12 @@ export const WARMUP_PROMPT = 'Ответь одним словом: готов.'
  * Системный промпт сессии подсказок. Свой промпт пользователя важнее встроенного;
  * правило «не рассуждай» добавляется только к встроенному — свой промпт не дописываем:
  * пользователь мог сознательно попросить рассуждения.
+ *
+ * context — блок материалов пользователя (contextBlock в @shared/contextFiles) или пусто.
+ * Дописывается к любому из промптов: резюме нужно и со встроенным, и со своим. Блок входит
+ * в сам промпт, поэтому смена файлов меняет промпт — и провайдеры открывают новую сессию
+ * тем же сравнением, что и при смене своего промпта.
  */
-export function suggestSystemPrompt(custom: string | undefined, noThinkingRule = false): string {
-  return custom?.trim() || SUGGEST_SYSTEM + (noThinkingRule ? NO_THINKING_RULE : '')
+export function suggestSystemPrompt(custom: string | undefined, noThinkingRule = false, context = ''): string {
+  return (custom?.trim() || SUGGEST_SYSTEM + (noThinkingRule ? NO_THINKING_RULE : '')) + context
 }

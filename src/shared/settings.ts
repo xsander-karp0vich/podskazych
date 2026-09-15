@@ -1,5 +1,6 @@
 import { DEFAULT_MODEL, isClaudeChoice, normalizeModel } from './models.ts'
 import { DEFAULT_PROVIDER, PROVIDER_IDS, isProviderId, providerById, type ProviderId } from './providers.ts'
+import { contextFilesOf, type ContextFile } from './contextFiles.ts'
 
 /** Как обращаться к Claude: живая сессия Claude Code на подписке или API по ключу. */
 export type ClaudeSource = 'cli' | 'api'
@@ -13,6 +14,11 @@ export interface AppSettings {
   fontSize: number
   /** скрывать окно от захвата экрана и скриншотов */
   contentProtected: boolean
+  /**
+   * Спрятать значок из трея. Значок возвращается сам, пока без него приложением не управлять:
+   * клики сквозь панель без своей клавиши или панель спрятана без клавиши (см. main/trayVisibility).
+   */
+  hideTray: boolean
   /** язык распознавания и ответов */
   language: 'ru' | 'en'
   /** подкладывать в запрос найденное во встроенной базе вопросов */
@@ -100,6 +106,12 @@ export interface AppSettings {
    * компанию и то, как вы хотите слышать подсказку.
    */
   customPrompt: string
+  /**
+   * Файлы для контекста: резюме, описание проекта. Здесь только список и флаги, сам текст —
+   * в папке данных приложения. Текст включённых уходит основной модели подсказок — со встроенным
+   * промптом и со своим одинаково; второму агенту — нет.
+   */
+  contextFiles: ContextFile[]
   /** обучение при первом запуске пройдено или пропущено — само больше не показывается */
   onboardingDone: boolean
 }
@@ -109,6 +121,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   opacity: 1,
   fontSize: 17,
   contentProtected: true,
+  // Значок в трее — привычный способ найти приложение без панели задач: прячут его только сами.
+  hideTray: false,
   language: 'ru',
   // База встроена в приложение — новому пользователю она нужна сразу: ответы из неё и мгновенные карточки.
   useKnowledgeBase: true,
@@ -135,6 +149,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   verifyEffort: 'high',
   verifyWeb: false,
   customPrompt: '',
+  contextFiles: [],
   onboardingDone: false,
 }
 
@@ -234,6 +249,10 @@ export function migrateSettings(raw: unknown): AppSettings {
     verifyModelByProvider,
     verifyEffort: VERIFY_EFFORTS.includes(saved.verifyEffort) ? saved.verifyEffort : DEFAULT_SETTINGS.verifyEffort,
     verifyWeb: saved.verifyWeb === true,
+    // Строго true: спрятать значок по битому значению — оставить приложение без запасного выхода.
+    hideTray: saved.hideTray === true,
+    // Список файлов правят руками и сбои записи: битые строки отбрасываем, остальные оставляем.
+    contextFiles: contextFilesOf(src.contextFiles),
   }
 }
 

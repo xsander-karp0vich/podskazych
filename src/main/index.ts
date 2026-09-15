@@ -2,7 +2,8 @@ import { app, BrowserWindow, clipboard, session, desktopCapturer, dialog, ipcMai
 import { createOverlayWindow, applyContentProtection, setClickThrough, canExcludeFromCapture } from './window'
 import { registerHotkeys, unregisterHotkeys, type HotkeyBindings } from './hotkeys'
 import { SttSidecar } from './stt/sidecar'
-import { createTray } from './tray'
+import { createTray, type TrayHandle } from './tray'
+import { parseTrayPref, serializeTrayPref, shouldShowTray } from './trayVisibility'
 import { createClickThrough } from './clickThrough'
 import { readBundledKb, type KbMeta } from './kb/bundled'
 import { loadIndex, isConfident, hitsToPrompt, type KbIndex, type KbHit } from './kb/search'
@@ -18,19 +19,46 @@ import { CancelledError, LlmError, isCancelled, isSkipped, type ImageInput, type
 import { registry, type ProviderStatus } from './llm/registry'
 import { sweepTempImages } from './llm/cli'
 import { VERIFY_SYSTEM, buildVerifyPrompt, parseVerdict, type VerifyStage, type VerifyUpdate } from './llm/verify'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, stat, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { captureScreen, imageTokens } from './screenshot'
 import { Journal, type JournalRef } from './journal'
 import type { OverlayStatus } from '@shared/types'
-import { keepLegacyUserData, migrateAutostart } from './appName'
+import { CONTEXT_MAX_FILES, CONTEXT_MAX_FILE_BYTES, type ContextFile } from '@shared/contextFiles'
+import { ContextStore } from './context/store'
+import { ContextError } from './context/extract'
+import { AUTOSTART_ARGS, keepLegacyUserData, migrateAutostart } from './appName'
 
 // До любых обращений к userData: переименование не должно сбросить настройки, журнал и кэш базы.
 keepLegacyUserData()
 
+/**
+ * Одна копия приложения. Значок можно спрятать из трея, и тогда повторный запуск — привычный способ
+ * вернуть панель: вторая копия не поднимается (две панели дрались бы за клавиши, хранилище настроек
+ * и журнал), а отдаёт управление первой — та получает 'second-instance'. Electron держит блокировку
+ * по папке данных, поэтому она берётся сразу после keepLegacyUserData и до всей тяжёлой работы.
+ *
+ * В dev по умолчанию без неё: electron-vite при пересборке main гасит процесс и тут же запускает
+ * новый — новый застал бы блокировку старого и вышел, и приложение просто пропадало бы.
+ * Проверить в dev — COPILOT_SINGLE_INSTANCE=1, лучше со своей COPILOT_USER_DATA.
+ */
+const singleInstance = app.isPackaged || process.env.COPILOT_SINGLE_INSTANCE === '1'
+/** Скрытый старт при входе в Windows: такой повторный запуск не должен выдёргивать панель посреди созвона. */
+const launchedHidden = AUTOSTART_ARGS.every((a) => process.argv.includes(a))
+const primaryInstance = !singleInstance || app.requestSingleInstanceLock({ hidden: launchedHidden })
+if (!primaryInstance) {
+  console.log('[copilot] уже запущен — панель откроется в первой копии')
+  // exit, а не quit: выйти нужно сразу, до ready — без окна, клавиш и событий выхода.
+  app.exit(0)
+}
+
+/** Текст прикреплённых файлов — рядом с настройками, в папке данных приложения. */
+const contextStore = new ContextStore(join(app.getPath('userData'), 'context'))
+
 let overlay: BrowserWindow | null = null
-let tray: Electron.Tray | null = null
+let tray: TrayHandle | null = null
 let hotkeys: HotkeyBindings = { ask: null, screenshot: null, addShot: null, session: null, toggleClickThrough: null, hide: null }
 /**
  * Режим «клики сквозь панель». Хоткей, трей и меню панели меняют его только
@@ -40,6 +68,104 @@ let hotkeys: HotkeyBindings = { ask: null, screenshot: null, addShot: null, sess
 const clickThrough = createClickThrough((on) => {
   if (overlay && !overlay.isDestroyed()) setClickThrough(overlay, on)
 })
+
+/* ---------- значок в трее ---------- */
+
+/** Копия настройки «Спрятать из трея» у main: трей создаётся раньше, чем окно прочитает свои настройки. */
+const trayPrefPath = join(app.getPath('userData'), 'tray.json')
+/** «Спрятать из трея»: с прошлого запуска, дальше — как её прислало окно. Источник правды — окно. */
+let hideTray = false
+/**
+ * Выход начался (before-quit или конец сеанса Windows): панель закрывается по-настоящему, а не прячется,
+ * и события её закрытия не должны вернуть значок.
+ */
+let quitting = false
+/** Панель ещё ни разу не показывалась. Она вот-вот появится — считаем её видимой, иначе значок мигнул бы при запуске. */
+let overlayShownOnce = false
+/** Рендерер загружен и не падал: пустое прозрачное окно не даёт ни меню, ни выхода. */
+let overlayUsable = true
+let trayPrefWrite: Promise<void> = Promise.resolve()
+
+function readTrayPref(): boolean {
+  try {
+    return parseTrayPref(readFileSync(trayPrefPath, 'utf8'))
+  } catch (e) {
+    // Нет файла — первый запуск или значок ни разу не прятали.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') console.warn('[tray] настройка не прочиталась:', e)
+    return false
+  }
+}
+
+function saveTrayPref(on: boolean): void {
+  // По очереди: два быстрых щелчка не должны лечь на диск в обратном порядке.
+  trayPrefWrite = trayPrefWrite
+    .then(() => writeFile(trayPrefPath, serializeTrayPref(on), 'utf8'))
+    .catch((e) => console.warn('[tray] настройка не сохранилась:', e))
+}
+
+/**
+ * Показать или убрать значок: по настройке и по запасным выходам (trayVisibility). Спрятать значок
+ * на Windows Electron не умеет, поэтому трей пересоздаётся — меню, подписка на режим и двойной
+ * щелчок у нового свои, у старого снимаются вместе с ним.
+ */
+function syncTray(): void {
+  if (quitting || !overlay || overlay.isDestroyed()) return
+  const want = shouldShowTray({
+    hideTray,
+    clickThroughOn: clickThrough.on,
+    clickThroughHotkey: hotkeys.toggleClickThrough,
+    overlayVisible: !overlayShownOnce || overlay.isVisible(),
+    hideHotkey: hotkeys.hide,
+    overlayUsable,
+  })
+  if (want && !tray) {
+    try {
+      // Трей — запасной выход из режима сквозь панель: пока он включён, по самой панели не кликнуть.
+      tray = createTray(overlay, { clickThrough, clickThroughCombo: hotkeys.toggleClickThrough })
+      console.log(`[tray] значок показан${hideTray ? ' — без него приложением не управлять' : ''}`)
+    } catch (e) {
+      console.error('[tray] значок не создался:', e)
+    }
+  } else if (!want && tray) {
+    tray.destroy()
+    tray = null
+    console.log('[tray] значок убран')
+  } else {
+    // Панель могли показать или спрятать клавишей — пункт «Показать / Спрятать панель» догоняет.
+    tray?.refresh()
+  }
+}
+
+let traySyncQueued = false
+/**
+ * То же после текущей задачи. Смена приходит и из меню самого значка («Клики сквозь панель»,
+ * «Показать панель», двойной щелчок): уничтожать трей внутри его же обработчика небезопасно.
+ */
+function queueTraySync(): void {
+  if (traySyncQueued) return
+  traySyncQueued = true
+  setTimeout(() => {
+    traySyncQueued = false
+    syncTray()
+  }, 0)
+}
+
+/**
+ * Запасная сетка на случай, если панель всё же уничтожена мимо выхода (закрытие перехвачено, но
+ * destroy или сбой его обходят). Копия без окна бесполезна: держит клавиши и блокировку одной копии,
+ * а повторный запуск отдавал бы управление ей и уходил в пустоту. Поэтому — перезапуск: просили
+ * панель клавишей или запуском, её и получат, уже в новой копии.
+ */
+function restartWithoutOverlay(reason: string): void {
+  if (quitting) return
+  console.warn(`[copilot] панели нет (${reason}) — перезапуск`)
+  // После обработчика: вторая копия должна успеть узнать, что запуск принят, а не застать выход.
+  setImmediate(() => {
+    if (quitting) return
+    app.relaunch()
+    app.quit()
+  })
+}
 
 const stt = new SttSidecar()
 let kbMeta: KbMeta | null = null
@@ -105,10 +231,15 @@ function choiceOf(p: LlmChoice): Choice {
 /** API по ключу: модель, размышления и свой промпт он не учитывает, лимита тишины у него нет. */
 const isClaudeApi = (c: Choice) => c.provider === 'claude' && c.claudeSource === 'api'
 
-/** Сессия подсказок под настройки из окна. Сессия сама решает, перезапускаться ли. */
+/**
+ * Сессия подсказок под настройки из окна. Сессия сама решает, перезапускаться ли.
+ * context — блок из текста включённых файлов (contextBlock): входит в системный промпт, поэтому
+ * смена файлов перезапускает сессию так же, как смена своего промпта. Второму агенту его не даём.
+ */
 function mainSession(
   c: Choice,
   p: { model?: ModelChoice; thinking?: boolean; effort?: EffortChoice; customPrompt?: string },
+  context: string,
 ): LlmSession {
   const s = registry.session(c.provider, 'main', { claudeSource: c.claudeSource })
   s.configure({
@@ -116,8 +247,50 @@ function mainSession(
     thinking: p.thinking !== false,
     effort: p.effort,
     systemPrompt: p.customPrompt,
+    context,
   })
   return s
+}
+
+/** Файлы для контекста, какие окно прислало включёнными: id и имя, по порядку списка. */
+type ContextRefs = Array<{ id: string; name: string }>
+
+/** Итог добавления: что легло в список и что не прочиталось — с причиной для строки списка. */
+interface ContextAddResult {
+  added: ContextFile[]
+  failed: Array<{ name: string; error: string }>
+  canceled?: true
+}
+
+/**
+ * Добавить файлы по одному. Один битый не должен срывать остальные: у каждого своя строка —
+ * добавлен или почему нет. have — сколько файлов уже в списке: больше десяти не берём.
+ */
+async function addContextFiles(
+  items: Array<{ name: string; size: () => Promise<number>; read: () => Promise<Uint8Array> }>,
+  have: unknown,
+): Promise<ContextAddResult> {
+  const room = CONTEXT_MAX_FILES - (typeof have === 'number' && Number.isInteger(have) && have > 0 ? have : 0)
+  const out: ContextAddResult = { added: [], failed: [] }
+  for (const it of items) {
+    const name = it.name.split(/[\\/]/).pop() || it.name
+    if (out.added.length >= room) {
+      out.failed.push({ name, error: `Не больше ${CONTEXT_MAX_FILES} файлов — уберите ненужные и добавьте снова` })
+      continue
+    }
+    try {
+      // Размер — до чтения: 300-мегабайтную презентацию незачем целиком тянуть в память ради отказа.
+      if ((await it.size()) > CONTEXT_MAX_FILE_BYTES) throw new ContextError('Файл больше 20 МБ')
+      out.added.push(await contextStore.add(name, await it.read()))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // Имя файла в лог не пишем: это чьё-то резюме, а лог уходит в сообщения об ошибках.
+      if (!(e instanceof ContextError)) console.warn('[context] файл не прочитался:', msg)
+      out.failed.push({ name, error: e instanceof ContextError ? msg : `Файл не прочитался: ${msg}` })
+    }
+  }
+  if (out.added.length) console.log(`[context] добавлено файлов: ${out.added.length}, символов: ${out.added.reduce((n, f) => n + f.chars, 0)}`)
+  return out
 }
 
 /** Вид ошибки — окну: по нему оно предлагает действие («Войти», «Как установить»), а не только текст. */
@@ -435,12 +608,29 @@ async function runVerification({ requestId, ref, question, answer, hits, cfg, to
 }
 
 app.whenReady().then(() => {
+  // Вторая копия уже выходит: ни окна, ни клавиш, ни значка ей не нужно.
+  if (!primaryInstance) return
   proxyUrl = configureProxy()
   installDisplayMediaHandler()
   // Снимки, записанные для CLI провайдеров и оставшиеся после падения, — убрать.
   void sweepTempImages()
 
   overlay = createOverlayWindow()
+  /*
+   * Закрыть панель можно и мимо выхода: Alt+F4 по безрамочному окну на Windows. Процесс при этом
+   * живёт (window-all-closed), держит клавиши и блокировку одной копии — а без окна значку нечем
+   * вернуться, и повторный запуск отдавал бы управление копии без панели. Поэтому вне выхода
+   * закрытие — это скрытие: дальше обычный путь 'hide' → запасной значок, и запуск её вернёт.
+   */
+  overlay.on('close', (e) => {
+    if (quitting) return
+    e.preventDefault()
+    overlay?.hide()
+  })
+  // Выключение или выход из Windows приходят без before-quit — окно должно закрыться, а не спрятаться.
+  overlay.on('session-end', () => {
+    quitting = true
+  })
 
   // После окна, а не до: пользователь видит панель сразу, снимок догоняет.
   void loadKnowledgeBase()
@@ -466,15 +656,66 @@ app.whenReady().then(() => {
       }
     },
     onHide: () => {
-      if (!overlay) return
+      if (!overlay || overlay.isDestroyed()) {
+        restartWithoutOverlay('клавиша «Скрыть панель»')
+        return
+      }
       if (overlay.isVisible()) overlay.hide()
       else overlay.show()
     },
   })
 
-  // Трей — запасной выход из режима сквозь панель: пока он включён, по самой панели не кликнуть.
   migrateAutostart()
-  tray = createTray(overlay, { clickThrough, clickThroughCombo: hotkeys.toggleClickThrough })
+  // Настройка — до первого значка: иначе при «Спрятать из трея» он мелькал бы на каждом запуске,
+  // пока окно не загрузится и не пришлёт свою. Клавиши к этому моменту уже заняты: запасные выходы
+  // считаются по тем, что достались на самом деле, — занимаются они один раз, при запуске.
+  hideTray = readTrayPref()
+  syncTray()
+  // Значок следит за всем, что делает его нужным: режимом сквозь панель, видимостью панели, живостью рендерера.
+  clickThrough.subscribe(() => queueTraySync())
+  overlay.on('show', () => {
+    overlayShownOnce = true
+    queueTraySync()
+  })
+  overlay.on('hide', queueTraySync)
+  overlay.webContents.on('did-finish-load', () => {
+    overlayUsable = true
+    queueTraySync()
+  })
+  overlay.webContents.on('did-fail-load', (_e, code, _desc, _url, isMainFrame) => {
+    // -3 — загрузку прервала следующая (перезагрузка окна), это не сбой.
+    if (!isMainFrame || code === -3) return
+    overlayUsable = false
+    queueTraySync()
+  })
+  overlay.webContents.on('render-process-gone', () => {
+    overlayUsable = false
+    queueTraySync()
+  })
+
+  // Повторный запуск — способ вернуть панель, когда значка в трее нет: показать её и дать по ней кликнуть.
+  app.on('second-instance', (_e, _argv, _cwd, data) => {
+    // Раньше проверки скрытого запуска: копия без панели бесполезна при любом запуске.
+    if (!overlay || overlay.isDestroyed()) {
+      restartWithoutOverlay('повторный запуск')
+      return
+    }
+    if (data && typeof data === 'object' && (data as { hidden?: unknown }).hidden === true) {
+      console.log('[copilot] повторный скрытый запуск — панель не трогаем')
+      return
+    }
+    if (clickThrough.on) {
+      // Панель, которая пропускает клики, мышью не вернуть — запуск должен отдавать управление целиком.
+      try {
+        clickThrough.set(false)
+      } catch (e) {
+        console.error('[clickthrough] окно не переключилось:', e)
+      }
+    }
+    if (overlay.isMinimized()) overlay.restore()
+    overlay.show()
+    overlay.focus()
+  })
 
   /**
    * Показ окна нельзя вешать только на ready-to-show. У скрытого прозрачного
@@ -594,6 +835,17 @@ app.whenReady().then(() => {
     overlay.setContentProtection(on && canExcludeFromCapture())
   })
 
+  // «Спрятать из трея». Настройка живёт в окне и приходит при загрузке и при каждой смене; main пишет
+  // копию на диск, только если она поменялась, — к следующему запуску значок уже знает, быть ли ему.
+  ipcMain.handle('window:setHideTray', (_e, on: unknown) => {
+    if (typeof on !== 'boolean') return
+    if (on !== hideTray) {
+      hideTray = on
+      saveTrayPref(on)
+    }
+    queueTraySync()
+  })
+
   ipcMain.handle('app:quit', () => app.quit())
 
   // Код из ответа. Буфер обмена — из main: окну для него нужен фокус, а панель поверх созвона его часто не держит.
@@ -705,6 +957,63 @@ app.whenReady().then(() => {
     }
   })
 
+  /* ---------- файлы для контекста ---------- */
+
+  // Список и флаги живут в настройках окна; main только извлекает текст, хранит его и собирает
+  // из него блок промпта. Поэтому «учитывать» — не отдельный вызов: флаг уходит с каждым вопросом.
+
+  /** Выбор файлов системным диалогом. have — сколько файлов уже в списке. */
+  ipcMain.handle('context:pick', async (_e, have: unknown): Promise<ContextAddResult> => {
+    const opts: Electron.OpenDialogOptions = {
+      title: 'Файлы для контекста',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'PDF, Word, текст', extensions: ['pdf', 'docx', 'txt', 'md'] }],
+    }
+    // Перегрузка с родительским окном не принимает явный undefined — как у сохранения записи.
+    const res = overlay ? await dialog.showOpenDialog(overlay, opts) : await dialog.showOpenDialog(opts)
+    if (res.canceled || !res.filePaths.length) return { added: [], failed: [], canceled: true }
+    return addContextFiles(
+      res.filePaths.map((path) => ({ name: path, size: async () => (await stat(path)).size, read: () => readFile(path) })),
+      have,
+    )
+  })
+
+  /**
+   * Перетаскивание: имя и байты. Путь к файлу окну недоступен, а доверять пути из окна и не нужно —
+   * читаем ровно то, что человек бросил на блок.
+   */
+  ipcMain.handle('context:addBuffers', async (_e, p: unknown): Promise<ContextAddResult> => {
+    const r = p && typeof p === 'object' ? (p as { files?: unknown; have?: unknown }) : {}
+    const files = Array.isArray(r.files) ? r.files : []
+    const items = files.flatMap((f: unknown) => {
+      const x = f && typeof f === 'object' ? (f as { name?: unknown; data?: unknown }) : {}
+      const data =
+        x.data instanceof ArrayBuffer
+          ? new Uint8Array(x.data)
+          : ArrayBuffer.isView(x.data)
+            ? new Uint8Array(x.data.buffer, x.data.byteOffset, x.data.byteLength)
+            : null
+      if (typeof x.name !== 'string' || !data) return []
+      return [{ name: x.name, size: async () => data.byteLength, read: async () => data }]
+    })
+    return addContextFiles(items, r.have)
+  })
+
+  /** Удалить текст файла. Путь — только из проверенного id: строка от окна путём не становится. */
+  ipcMain.handle('context:remove', async (_e, id: unknown) => {
+    if (typeof id === 'string') await contextStore.remove(id)
+  })
+
+  /** Какие файлы списка потеряли текст на диске — окно покажет это в строке файла. */
+  ipcMain.handle('context:missing', (_e, ids: unknown) =>
+    contextStore.missing(Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : []),
+  )
+
+  /** Тексты, которых больше нет в списке: настройки сбросили или правка списка не сохранилась. */
+  ipcMain.handle('context:prune', (_e, keep: unknown) =>
+    contextStore.prune(Array.isArray(keep) ? keep.filter((x): x is string => typeof x === 'string') : []),
+  )
+
   /* ---------- подсказка ---------- */
 
   ipcMain.handle(
@@ -725,6 +1034,8 @@ app.whenReady().then(() => {
         effort?: EffortChoice
         /** сколько ждать ответа, секунд */
         timeoutSec?: number
+        /** включённые файлы для контекста */
+        contextFiles?: ContextRefs
       },
     ) => {
       const c = choiceOf(p)
@@ -804,7 +1115,7 @@ ${body}` : body
             kind: 'not-logged-in' as const,
           }
         }
-        const session = mainSession(c, p)
+        const session = mainSession(c, p, await contextStore.block(p.contextFiles))
         // Таймаут обязателен: без него зависший CLI оставляет интерфейс
         // крутиться вечно, и пользователь не понимает, что произошло.
         // Считается по тишине: живой длинный ответ он не обрывает.
@@ -900,12 +1211,14 @@ ${body}` : body
         effort?: EffortChoice
         /** основную сессию не греть (Claude по ключу, провайдер без входа), но второго агента — да */
         skipMain?: boolean
+        contextFiles?: ContextRefs
       },
     ) => {
       try {
         const c = choiceOf(p ?? {})
         // Сессия основного не создаётся вовсе: иначе смена провайдера гасила бы прежнюю ради ошибки.
-        const session = p?.skipMain ? null : mainSession(c, p ?? {})
+        // Греем уже с файлами: иначе первый вопрос открыл бы сессию заново ради блока материалов.
+        const session = p?.skipMain ? null : mainSession(c, p ?? {}, await contextStore.block(p?.contextFiles))
         // Проверяющего греем параллельно: его старт тоже лучше оплатить до созвона.
         // Его настройки приходят только через 'llm:verify-config': прогрев бывает из
         // устаревшего замыкания — старт сессии секундами ждёт распознавание — и затёр бы свежие.
@@ -1041,6 +1354,7 @@ ${body}` : body
         thinking?: boolean
         effort?: EffortChoice
         timeoutSec?: number
+        contextFiles?: ContextRefs
       },
     ) => {
       let previews: string[] = []
@@ -1103,7 +1417,8 @@ ${body}` : body
         // Через подписку: снимки уходят картинками в ту же живую сессию, что и подсказки.
         // Правила разбора — в самом сообщении: системный промпт сессии уже задан под расшифровку.
         // API по ключу берёт правила отдельной системной ролью — ему уходят части вопроса (screen).
-        const session = mainSession(c, p)
+        // Та же сессия, что у подсказок, и с тем же блоком файлов: иначе снимок перезапускал бы её.
+        const session = mainSession(c, p, await contextStore.block(p.contextFiles))
         const agent = providerById(c.provider).agent
         let saidThinking = false
         // Снимок дольше текста: загрузка картинки и префилл визуальных токенов. Лимит тишины — не меньше
@@ -1159,13 +1474,23 @@ app.on('window-all-closed', () => {
   /* держим процесс живым — выход через трей или меню */
 })
 
+// Выход начинается здесь, а не в will-quit: между ними окна закрываются, и перехват закрытия
+// панели (скрытие вместо закрытия) отменил бы выход из трея и из меню.
+app.on('before-quit', () => {
+  quitting = true
+})
+
 app.on('will-quit', () => {
+  // Вторая копия ничего не занимала — и отпускать ей нечего.
+  if (!primaryInstance) return
   unregisterHotkeys()
   journal.close()
   stt.stop()
   // Выход — отмена, а не сбой: иначе оборванная подсказка открыла бы новую запись в уже закрытом журнале.
   registry.stopAll(new CancelledError())
+  quitting = true
   tray?.destroy()
+  tray = null
 })
 
 app.on('browser-window-created', (_e, win) => applyContentProtection(win))
