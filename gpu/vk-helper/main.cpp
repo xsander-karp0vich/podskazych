@@ -174,6 +174,31 @@ size_t utf8_valid_len(const unsigned char * s, size_t n) {
     return need + 1;
 }
 
+// Обрыв декодера на лимите токенов (maxTokens или зацикливание до n_text_ctx) оставляет
+// в самом конце начало многобайтного символа. Это обрезка, а не мусор в тексте, поэтому
+// такой хвост отбрасываем, а не превращаем в U+FFFD.
+void trim_incomplete_utf8_tail(std::string & s) {
+    const size_t n = s.size();
+    size_t cont = 0;  // байты продолжения 10xxxxxx в конце
+    while (cont < 3 && cont < n && ((unsigned char) s[n - 1 - cont] & 0xC0) == 0x80) ++cont;
+    if (cont == n) return;
+    const size_t lead = n - 1 - cont;
+    const unsigned char c = (unsigned char) s[lead];
+    size_t need;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) { need = 1; }
+    else if (c == 0xE0) { need = 2; lo = 0xA0; }
+    else if ((c >= 0xE1 && c <= 0xEC) || c == 0xEE || c == 0xEF) { need = 2; }
+    else if (c == 0xED) { need = 2; hi = 0x9F; }
+    else if (c == 0xF0) { need = 3; lo = 0x90; }
+    else if (c >= 0xF1 && c <= 0xF3) { need = 3; }
+    else if (c == 0xF4) { need = 3; hi = 0x8F; }
+    else return;          // не начало многобайтного символа
+    if (cont >= need) return;  // символ полный (или лишние байты) — решит json_escape_into
+    if (cont >= 1 && ((unsigned char) s[lead + 1] < lo || (unsigned char) s[lead + 1] > hi)) return;
+    s.resize(lead);
+}
+
 void json_escape_into(std::string & out, const std::string & s) {
     static const char * hex = "0123456789abcdef";
     const unsigned char * p = (const unsigned char *) s.data();
@@ -1225,6 +1250,7 @@ bool handle_transcribe(const JsonObject & msg, Input & in, int64_t samples) {
         const char * seg = whisper_full_get_segment_text(g.ctx, i);
         if (seg) text += seg;
     }
+    trim_incomplete_utf8_tail(text);
 
     JsonWriter w;
     w.str("type", "result").num("id", id).str("text", text).num("ms", ms);
