@@ -8,8 +8,16 @@ import {
   type CSSProperties,
   type ReactNode,
 } from 'react'
-import { MicCapture, listMicrophones } from './audio/capture'
-import { SttClient, type SttMessage, type HotwordsInfo } from './stt/client'
+import { MicCapture, listMicrophones, type MicEvent } from './audio/capture'
+import {
+  BacklogWatch,
+  RECONNECTING,
+  SttClient,
+  healthLag,
+  type HotwordsInfo,
+  type SttHealth,
+  type SttMessage,
+} from './stt/client'
 import { Menu } from './components/Menu'
 import { Settings } from './components/Settings'
 import { Answer } from './components/Answer'
@@ -131,6 +139,12 @@ const AFTERGLOW_MS = 2000
 const FLASH_MS = 380
 /** Сколько висит строка «провайдер не готов» после выбора его модели — как в макете. */
 const NOTICE_MS = 5000
+/**
+ * Черновик реплики, не менявшийся столько, уже не закроется: финал потерялся
+ * вместе с сокетом или сайдкаром. Живой черновик меняется с каждой гипотезой,
+ * а финал за последней приходит за секунды — даже при заметном отставании.
+ */
+const STALE_DRAFT_MS = 40_000
 
 interface Line {
   id: number
@@ -633,6 +647,16 @@ export function App() {
     transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight })
   }, [lines, draft])
 
+  // Страховка от зависшего черновика: без неё обрывок фразы висел бы на экране
+  // до следующей реплики этого канала, а при мёртвом канале — до конца сессии.
+  const dropStaleDraft = (ch: Speaker, text: string) => {
+    if (!text) return
+    const t = window.setTimeout(() => setDraft((d) => (d[ch] === text ? { ...d, [ch]: '' } : d)), STALE_DRAFT_MS)
+    return () => window.clearTimeout(t)
+  }
+  useEffect(() => dropStaleDraft('me', draft.me), [draft.me])
+  useEffect(() => dropStaleDraft('them', draft.them), [draft.them])
+
   /* ---------- расшифровка ---------- */
 
   const onStt = useCallback((m: SttMessage) => {
@@ -644,11 +668,54 @@ export function App() {
       setDraft((d) => ({ ...d, [m.channel]: m.text }))
       return
     }
+    // Финал приходит и пустым: реплика закрыта, а строки нет (шум, эхо, сбой
+    // прогона). Черновик убираем в любом случае — иначе он висел бы до следующей.
     setDraft((d) => ({ ...d, [m.channel]: '' }))
     if (m.text.trim()) {
       window.copilot.journalLine(m.channel, m.text)
       setLines((ls) => [...ls.slice(-200), { id: nextId.current++, speaker: m.channel, text: m.text }])
     }
+  }, [])
+
+  /**
+   * Предупреждение об отставании распознавания — в ту же строку ошибки, что и
+   * остальные: снимаем и обновляем только своё, чужие ошибки не трогаем.
+   */
+  const backlog = useRef(new BacklogWatch())
+  const lagNotice = useRef<string | null>(null)
+  const onSttHealth = useCallback((ch: Speaker, h: SttHealth) => {
+    const lag = backlog.current.note(ch, healthLag(h))
+    const text = lag === null ? null : `Распознавание не успевает — задержка ${Math.round(lag)} с`
+    const prev = lagNotice.current
+    if (text === prev) return
+    lagNotice.current = text
+    setError((e) => (prev === null || e === prev ? text : e))
+  }, [])
+
+  // Канал оборвался и переподключается: финал его черновика уже не придёт.
+  const onSttReset = useCallback((ch: Speaker) => {
+    setDraft((d) => (d[ch] ? { ...d, [ch]: '' } : d))
+  }, [])
+
+  const onSttRestored = useCallback(() => {
+    setError((e) => (e === RECONNECTING ? null : e))
+  }, [])
+
+  // Микрофон пропал или контекст встал посреди созвона. Сам вернулся — только в лог;
+  // не вернулся — это надо видеть, иначе «Я» молчит без объяснений.
+  const micFailure = useRef<string | null>(null)
+  const onMicEvent = useCallback((ev: MicEvent) => {
+    if (ev.kind === 'failed') {
+      console.error('[mic] ' + ev.message)
+      micFailure.current = ev.message
+      setError(ev.message)
+      return
+    }
+    console.warn('[mic] ' + ev.message)
+    // Захват вернулся (например, гарнитуру подключили обратно) — прошлая ошибка уже неправда.
+    const prev = micFailure.current
+    micFailure.current = null
+    if (prev) setError((e) => (e === prev ? null : e))
   }, [])
 
   /** Ответ модели пошёл — открываем его, если пользователь всё ещё смотрит на ответ из базы. */
@@ -754,6 +821,13 @@ export function App() {
     await window.copilot.stopStt()
     pending.current = { me: -100, them: -100 }
     setDraft({ me: '', them: '' })
+    // Отставание, переподключение и потерянный микрофон — про кончившуюся сессию;
+    // прочие ошибки остаются.
+    const stale = [RECONNECTING, lagNotice.current, micFailure.current]
+    lagNotice.current = null
+    micFailure.current = null
+    backlog.current = new BacklogWatch()
+    setError((e) => (e !== null && stale.includes(e) ? null : e))
     setLoopbackOk(false)
     setPhase('idle')
   }, [])
@@ -768,9 +842,16 @@ export function App() {
       setLoopbackOk(Boolean(res.info.loopbackDevice) && !res.info.loopbackError)
       if (res.info.loopbackError) setError(`Звук собеседника: ${res.info.loopbackError}`)
 
-      const stt = new SttClient(res.info.port, res.info.token, onStt, setError, setHotwords)
-      await stt.connect(['me', 'them'])
+      const stt = new SttClient(res.info.port, res.info.token, onStt, setError, setHotwords, {
+        onHealth: onSttHealth,
+        onChannelReset: onSttReset,
+        onRestored: onSttRestored,
+      })
+      // Клиент — в ref до подключения: если один канал открылся, а другой нет,
+      // stop() из catch закроет открывшийся, и тот не станет переподключаться к
+      // остановленному сайдкару.
       sttRef.current = stt
+      await stt.connect(['me', 'them'])
       // Словарь — сразу, не дожидаясь первой смены темы: имена и постоянная
       // часть нужны с первой же реплики.
       stt.sendHotwords(termsRef.current)
@@ -778,7 +859,7 @@ export function App() {
       const mic = new MicCapture((pcm) => {
         pending.current.me = rmsDb(pcm)
         stt.send('me', pcm)
-      })
+      }, onMicEvent)
       await mic.start(settings.micDeviceId || undefined)
       micRef.current = mic
 
@@ -802,8 +883,25 @@ export function App() {
     settings.llmModel,
     settings.llmThinking,
     onStt,
+    onSttHealth,
+    onSttReset,
+    onSttRestored,
+    onMicEvent,
     stop,
   ])
+
+  // Сайдкар умер посреди сессии. Переподключаться клиенту не к чему: закрываем
+  // сессию и говорим почему, иначе окно показывало бы «сессия идёт» над тишиной.
+  useEffect(
+    () =>
+      window.copilot.onSttExit(({ error: reason }) => {
+        if (!sttRef.current) return
+        sttRef.current.close()
+        console.error('[stt] ' + reason)
+        void stop().then(() => setError(reason))
+      }),
+    [stop],
+  )
 
   const toggleSession = useCallback(() => {
     if (phase === 'starting') return

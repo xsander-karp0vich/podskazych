@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob
 import os
 import site
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -80,9 +81,9 @@ class Caps:
     partial_every_ms: int
     # реплика длиннее закрывается принудительно
     max_utterance_ms: int
-    # во сколько раз пауза между гипотезами должна превышать длительность
-    # последнего распознавания; 0 — только расписание. На CUDA 0, чтобы
-    # поведение на видеокарте не менялось.
+    # > 0 — устройство медленное (процессор): черновик считается, только когда
+    # модель простаивает, и показывается сразу, без второй гипотезы — см.
+    # Transcriber в asr.py. 0 — черновики по расписанию, как на CUDA.
     backoff: float = 0.0
     # с какой длины реплики её переспрашивать: обрывок в полслова модель
     # превращает в мусор, а на процессоре каждый переспрос стоит секунду
@@ -167,9 +168,9 @@ class Engine:
         if device == "cuda":
             self.caps = Caps(partial_every_ms=700, max_utterance_ms=30_000)
         else:
-            # Реплика в 10 с на 4 потоках — около секунды: переспрос не чаще
-            # раза в 1.5 с и не чаще трёх длительностей распознавания, иначе
-            # второй канал ждёт, а захват звука копится в очереди.
+            # Реплика в 10 с на 4 потоках — около секунды: черновик не чаще
+            # раза в 1.5 с после конца прошлого и только в простое модели,
+            # иначе финалы обоих каналов ждут переспросов.
             self.caps = Caps(
                 partial_every_ms=1500,
                 max_utterance_ms=CPU_MAX_UTTERANCE_MS,
@@ -221,9 +222,18 @@ class Engine:
         self.hotwords = text
         return {"kept": len(kept), "total": len(clean), "tokens": count(text) if text else 0}
 
+    # сколько занял прогрев; 0 — ещё не грелись
+    warm_up_s = 0.0
+
     def warm_up(self) -> None:
-        """Прогон вхолостую: ошибки вроде ненайденной cuBLAS всплывают только на первом вызове."""
+        """Прогон вхолостую: ошибки вроде ненайденной cuBLAS всплывают только на первом вызове.
+
+        Заодно замеряем его: это первая оценка стоимости прогона для очереди в
+        asr.py. Второй холостой прогон ради замера стоил бы секунду старта.
+        """
+        started = time.monotonic()
         self.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        self.warm_up_s = time.monotonic() - started
 
     def transcribe(self, audio: np.ndarray) -> tuple[str, float]:
         """Текст реплики и длительность речи в секундах."""

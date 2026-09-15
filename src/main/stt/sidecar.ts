@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createServer } from 'node:net'
 import { randomBytes } from 'node:crypto'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { existsSync } from 'node:fs'
+import { appendFile, mkdir, rename, stat } from 'node:fs/promises'
 import { app } from 'electron'
 
 export interface SidecarInfo {
@@ -119,9 +120,66 @@ function sidecarEnv(packaged: boolean): NodeJS.ProcessEnv {
   return env
 }
 
+/** Больше этого лог переезжает в stt.1.log: хватает на много созвонов и не растёт без конца. */
+const LOG_MAX_BYTES = 5 * 1024 * 1024
+
+/**
+ * Лог сайдкара на диске. Раньше stderr держался в памяти и показывался, только
+ * если процесс не поднялся: обрыв сокета микрофона посреди созвона и трассировки
+ * websockets не оставляли следа, и понять по жалобе тестера было нечего.
+ *
+ * Пишем stdout и stderr построчно. Текста расшифровки тут нет: реплики идут
+ * окну по WebSocket, а в stdout — только готовность, замеры, события и ошибки.
+ * Запись асинхронная и последовательная: main не ждёт диска на каждой строке.
+ */
+class SttLog {
+  readonly file: string
+  private size = -1
+  private chain: Promise<void> = Promise.resolve()
+
+  constructor(file: string) {
+    this.file = file
+  }
+
+  write(stream: 'out' | 'err' | 'app', lines: string[]): void {
+    const stamp = new Date().toISOString()
+    const chunk = lines
+      .filter((l) => l.trim())
+      .map((l) => `${stamp} ${stream} ${l.trimEnd()}\n`)
+      .join('')
+    if (!chunk) return
+    // Сбой диска не должен ронять распознавание: строка пропадёт, созвон — нет.
+    this.chain = this.chain.then(() => this.append(chunk)).catch(() => {})
+  }
+
+  private async append(chunk: string): Promise<void> {
+    if (this.size < 0) {
+      await mkdir(dirname(this.file), { recursive: true })
+      this.size = await stat(this.file).then(
+        (s) => s.size,
+        () => 0,
+      )
+    }
+    if (this.size > LOG_MAX_BYTES) {
+      // Не переименовался (файл держит второй экземпляр) — пишем дальше в тот же,
+      // попробуем снова на следующем круге.
+      await rename(this.file, this.file.replace(/\.log$/, '.1.log')).catch(() => {})
+      this.size = 0
+    }
+    await appendFile(this.file, chunk)
+    this.size += Buffer.byteLength(chunk)
+  }
+}
+
 export class SttSidecar {
   private proc: ChildProcessWithoutNullStreams | null = null
   private info: SidecarInfo | null = null
+  private log: SttLog | null = null
+  /**
+   * Процесс завершился сам, уже после готовности: не «Стоп» и не таймаут старта.
+   * Окну надо перестать переподключаться и показать причину.
+   */
+  onExit: ((error: string) => void) | null = null
 
   async start(opts: { language?: string; glossary?: string; model?: string } = {}): Promise<SidecarInfo> {
     if (this.info) return this.info
@@ -153,6 +211,11 @@ export class SttSidecar {
     // установленный у пользователя Python той же версии), -s не берёт пакеты из
     // профиля, -X utf8 заменяет PYTHONUTF8, который -E игнорирует.
     const isolation = paths.packaged ? ['-E', '-s', '-X', 'utf8'] : []
+
+    // Путь — не при импорте модуля: папку userData main выставляет при запуске (appName.ts).
+    const log = (this.log ??= new SttLog(join(app.getPath('userData'), 'logs', 'stt.log')))
+    console.log('[stt] лог распознавания:', log.file)
+    log.write('app', [`запуск сайдкара: устройство ${device}, модель ${model.split(/[\\/]/).pop()}`])
 
     const proc = spawn(
       python,
@@ -186,13 +249,17 @@ export class SttSidecar {
       // каждые двадцать секунд, весь созвон. Раньше stdout копился в одной
       // строке до конца сессии и просматривался целиком на каждый чанк.
       let pending = ''
+      let pendingErr = ''
       let stderr = ''
+      // Готовность уже отдана окну: выход после неё — падение посреди сессии, а не неудачный старт.
+      let ready = false
 
       proc.stdout.on('data', (b: Buffer) => {
         pending += b.toString()
         const lines = pending.split('\n')
         // Последний кусок может быть недописанной строкой — ждём продолжения.
         pending = lines.pop() ?? ''
+        log.write('out', lines)
 
         for (const line of lines) {
           if (!line.trim()) continue
@@ -206,6 +273,7 @@ export class SttSidecar {
             loopbackDevice?: string | null
             loopbackError?: string | null
             stats?: unknown
+            event?: string
             error?: string
             fatal?: { code?: string; message?: string }
           }
@@ -217,6 +285,7 @@ export class SttSidecar {
 
           if (msg.ready) {
             clearTimeout(timer)
+            ready = true
             const model = msg.model ?? ''
             const device = msg.device ?? ''
             this.info = {
@@ -240,6 +309,10 @@ export class SttSidecar {
             // понять по логу, что у собеседника плохой микрофон, а не модель
             // плохо слышит.
             console.log('[stt] уровни:', JSON.stringify(msg.stats))
+          } else if (msg.event) {
+            // Закрытие сокета, замена подключения микрофона — то, что раньше
+            // происходило молча и объясняло «перестал слышать мой голос».
+            console.log('[stt] событие:', line)
           } else if (msg.error) {
             console.error('[stt]', msg.error)
           }
@@ -247,23 +320,50 @@ export class SttSidecar {
       })
 
       proc.stderr.on('data', (b: Buffer) => {
-        stderr += b.toString()
+        const text = b.toString()
+        stderr += text
         if (stderr.length > 8000) stderr = stderr.slice(-8000)
+        pendingErr += text
+        const lines = pendingErr.split('\n')
+        pendingErr = lines.pop() ?? ''
+        log.write('err', lines)
+        for (const line of lines) if (line.trim()) console.error('[stt:err]', line.trimEnd())
       })
 
       proc.once('error', (e) => {
         clearTimeout(timer)
+        log.write('app', [`процесс не запустился: ${e.message}`])
         reject(e)
       })
-      proc.once('exit', (code) => {
+      // Хвосты без перевода строки — по 'close', когда потоки дочитаны: после 'exit'
+      // данные ещё приходят. А недописанная строка — часто последняя строка трассировки.
+      proc.once('close', () => {
+        log.write('out', [pending])
+        log.write('err', [pendingErr])
+        if (pendingErr.trim()) console.error('[stt:err]', pendingErr.trimEnd())
+      })
+      proc.once('exit', (code, signal) => {
         clearTimeout(timer)
+        log.write('app', [`выход: код ${code}${signal ? `, сигнал ${signal}` : ''}`])
         // Старый процесс может умереть уже после нового «Старт» — его выход
-        // не должен стирать сведения о новом.
-        if (this.proc === proc) {
+        // не должен стирать сведения о новом. И «Стоп», и таймаут старта отвязывают
+        // процесс раньше, чем придёт его выход, так что совпадение здесь — выход,
+        // которого никто не просил.
+        const unexpected = this.proc === proc
+        if (unexpected) {
           this.proc = null
           this.info = null
         }
-        if (code !== 0) reject(new Error(fatal ?? `Сайдкар упал (код ${code}):\n${stderr.slice(-2000)}`))
+        if (!ready) {
+          // Таймер уже снят: без reject и на коде 0 «Старт» ждал бы вечно.
+          reject(new Error(fatal ?? `Сайдкар упал (код ${code ?? signal}):\n${stderr.slice(-2000)}`))
+          return
+        }
+        if (unexpected) {
+          const reason = fatal ?? `код ${code ?? signal}`
+          console.error('[stt] сайдкар завершился посреди сессии:', reason)
+          this.onExit?.(`Распознавание речи остановилось (${reason}) — начните сессию заново`)
+        }
       })
     })
   }

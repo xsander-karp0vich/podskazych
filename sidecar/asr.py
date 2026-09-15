@@ -11,9 +11,12 @@
 Раздельные каналы дают точную диаризацию без speaker-diarization модели.
 
 Whisper не потоковый (окно 30 с, на тишине галлюцинирует), поэтому режем сами:
-VAD выделяет реплику, каждые Caps.partial_every_ms (engines.py) переспрашиваем
-растущий буфер, показываем только префикс, совпавший в двух гипотезах подряд
-(LocalAgreement-2) — иначе текст мерцает и читать его невозможно.
+VAD выделяет реплику, а модель переспрашивает растущий буфер, когда до неё
+доходит очередь (Transcriber). На видеокарте переспрос идёт каждые
+Caps.partial_every_ms (engines.py), и показывается только префикс, совпавший
+в двух гипотезах подряд (LocalAgreement-2) — иначе текст мерцает и читать его
+невозможно. На процессоре второй гипотезы не дождаться, поэтому черновик
+считается, только пока модель свободна, и показывается сразу.
 """
 from __future__ import annotations
 
@@ -79,14 +82,82 @@ LEVEL_EVERY_MS = 120
 # Не глушим канал совсем (иначе потеряем перебивку), а поднимаем порог.
 DUCK_HANGOVER_MS = 900
 DUCK_EXTRA_DB = 12.0
-# Похожесть, при которой считаем реплику эхом уже сказанного собеседником
 STATS_EVERY_S = 20.0
 # Сколько раз подряд должна повториться цепочка слов, чтобы счесть её зацикливанием
 LOOP_TIMES = 3
 # Потолок темпа речи, слов в секунду: норма русской спонтанной речи 2.5-3
 MAX_WORDS_PER_S = 5.0
+
+# --- эхо собеседника в микрофоне ---
+# Похожесть, при которой считаем реплику эхом уже сказанного собеседником
 ECHO_SIMILARITY = 0.72
-ECHO_WINDOW_S = 12.0
+# ...и только если длины сравнимы: иначе короткое «да, конечно» похоже на
+# длинный ответ, который с него начинается
+ECHO_LEN_RATIO = (0.6, 1.6)
+# Сверяем только с репликами собеседника, звучавшими в то же время, с запасом:
+# эхо приходит в микрофон одновременно с оригиналом, а не через 12 с.
+ECHO_OVERLAP_S = 1.5
+# Короче — не эхо: «да», «ага» говорят обе стороны
+ECHO_MIN_CHARS = 6
+# Сколько слов должно остаться от реплики, когда из неё вырезано эхо
+ECHO_REST_MIN_WORDS = 2
+# Сколько хранить реплики собеседника. Сверка идёт по времени звучания, так
+# что старые реплики ни с чем лишним не совпадут, а финал микрофона под
+# нагрузкой приходит заметно позже самой речи.
+ECHO_KEEP_S = 90.0
+
+# --- очередь модели (Transcriber) ---
+# Загрузка модели, выше которой процессор не тратит время на черновики:
+# финалам всегда должен оставаться свободный воркер.
+PARTIAL_LOAD_WINDOW_S = 12.0
+PARTIAL_LOAD_MAX = 0.5
+# За какое время считаем загрузку модели для health и stats
+LOAD_WINDOW_S = 20.0
+# Сглаживание оценки стоимости прогона: один выброс (шум, долгое декодирование)
+# не должен надолго выключать черновики
+COST_EMA = 0.3
+# Досчитанный финал микрофона, звучавший поверх собеседника, отдаётся только
+# после сверки с его словами — иначе эхо сверялось бы с ещё не распознанной
+# фразой и проходило. Ждём не модель, а готовый текст, и не дольше этого.
+ECHO_WAIT_S = 20.0
+# Реплику собеседника, которая ещё идёт, не ждём до конца: он может говорить
+# полминуты, а ответ пользователя висел бы всё это время. Сверяем с его
+# свежей гипотезой; нет такой, что покрывает конец нашей речи, — ждём её
+# не дольше этого после конца речи. На видеокарте гипотеза обновляется
+# каждые 700 мс и ожидание почти не срабатывает, на процессоре финал
+# и так приходит позже.
+ECHO_OPEN_WAIT_S = 2.0
+# Гипотеза годится для сверки, только если в её звук вошло ещё столько после
+# конца нашей речи: слово на самом краю буфера модель обрывает или теряет,
+# и эхо, совпавшее со всем, кроме последнего слова, прошло бы как речь.
+ECHO_DRAFT_MARGIN_S = 0.3
+# Как часто пересматривать финалы, которые ждут сверки
+HOLD_RECHECK_S = 0.25
+# Когда голова очереди ждёт дольше этого, модель отстаёт, и финалы собеседника
+# идут раньше реплик микрофона, прозвучавших поверх него: на слова собеседника
+# отвечает подсказчик, а такие реплики чаще всего эхо.
+THEM_FIRST_WAIT_S = 2.0
+ECHO_LIKELY_DUCKED = 0.5
+# Сброс нагрузки: реплики микрофона выбрасываются без прогона, только когда
+# модель по-настоящему отстаёт (в очереди больше SHED_ME_BACKLOG_S звука
+# и старейшая реплика ждёт дольше SHED_WAIT_S) и реплика похожа на эхо:
+# почти целиком поверх собеседника и заметно тише обычного голоса
+# пользователя. Одна длинная очередь без ожидания — не отставание: реплика
+# в 26 с на видеокарте считается за полсекунды. А «поверх собеседника» само
+# по себе не эхо: перебивку и ответ во время его фразы терять нельзя.
+SHED_ME_BACKLOG_S = 20.0
+SHED_WAIT_S = 6.0
+SHED_DUCKED_SHARE = 0.8
+SHED_QUIET_DB = 6.0
+# Сколько замеров своего голоса нужно, чтобы судить, что реплика тише обычного
+OWN_LEVEL_MIN_SAMPLES = 20
+# На видеокарте ритм черновиков — от прошлой просьбы о прогоне, но между концом
+# одного прогона и следующим оставляем хотя бы столько: на медленной
+# видеокарте прогоны иначе шли бы вплотную и занимали модель целиком.
+PARTIAL_REST_MS = 150
+HEALTH_EVERY_S = 5.0
+# Шаг, которым меряем, насколько event loop не успевает к своим задачам
+LOOP_TICK_S = 0.1
 
 
 def rms_dbfs(pcm: np.ndarray) -> float:
@@ -231,6 +302,12 @@ HALLUCINATION_PATTERNS = [
 # Пометки звука вместо речи: «ДИНАМИЧНАЯ МУЗЫКА», «[аплодисменты]». Отсекаем их
 # только вместе со словом про звук: реплика «СКД» капсом — это речь, её трогать нельзя.
 SOUND_WORDS = re.compile(r"музык|аплодисмент|смех|шум|тишин|гудок|звонок")
+# Короткие, но настоящие ответы. Проверка «две буквы и меньше — огрызок»
+# выбрасывала «Да.», «Ок.» и «Ну», а черновик реплики так и висел на экране.
+SHORT_WORDS = frozenset({
+    "да", "ок", "ну", "не", "но", "а", "и", "я", "ты", "вы", "мы", "он", "от", "до",
+    "на", "за", "по", "так", "вот", "нет", "ага", "угу",
+})
 
 
 def loops(words: list[str]) -> bool:
@@ -250,7 +327,7 @@ def loops(words: list[str]) -> bool:
     return False
 
 
-def looks_like_noise(text: str, dur_s: float = 0.0) -> bool:
+def looks_like_noise(text: str, dur_s: float = 0.0, audio_s: float = 0.0) -> bool:
     """Похоже ли это на выдумку, а не на речь.
 
     Опираться на no_speech_prob нельзя: на наших весах large-v3-turbo он
@@ -258,6 +335,8 @@ def looks_like_noise(text: str, dur_s: float = 0.0) -> bool:
     на это открыты issue #1028 и #1128). avg_logprob тоже не спасает — на
     чистом шуме модель выдала «Продолжение следует...» с уверенностью
     −0.142, то есть очень высокой. Поэтому решают текстовые признаки.
+
+    dur_s — сколько речи насчитал движок, audio_s — сколько звука ушло в модель.
     """
     t = text.strip().lower().strip(".!? ")
     if not t:
@@ -271,16 +350,21 @@ def looks_like_noise(text: str, dur_s: float = 0.0) -> bool:
     bracketed = bool(re.fullmatch(r"\s*[\[(].*[\])]\s*", text))
     if (shouted or bracketed) and SOUND_WORDS.search(t):
         return True
-    # Одиночный короткий огрызок без гласных смысла не несёт
-    if len(t) <= 2:
+    # Одиночный короткий огрызок без гласных смысла не несёт — если это не
+    # короткий ответ из SHORT_WORDS
+    if len(t) <= 2 and re.sub(r"\W", "", t) not in SHORT_WORDS:
         return True
 
     words = t.split()
     if loops(words):
         return True
     # Русская спонтанная речь идёт 2.5-3 слова в секунду. Вдвое быстрее —
-    # это не расшифровка, а поток, придуманный поверх тишины.
-    if dur_s >= 1.0 and len(words) / dur_s > MAX_WORDS_PER_S:
+    # это не расшифровка, а поток, придуманный поверх тишины. Делим на длину
+    # звука, а не только на span сегментов: на CUDA span короче звучания, и
+    # быстрая, но настоящая фраза «Ну, а я не знаю, да, это же не так.» за
+    # 1.6 с span выходила за 6 слов в секунду и пропадала.
+    dur = max(dur_s, audio_s)
+    if dur >= 1.0 and len(words) / dur > MAX_WORDS_PER_S:
         return True
     return False
 
@@ -295,6 +379,25 @@ def common_prefix(a: str, b: str) -> str:
     return " ".join(out)
 
 
+_WORD = re.compile(r"\w+")
+
+
+def _words(text: str) -> list[str]:
+    """Слова без знаков и регистра: «Ну, понятно.» и «ну понятно» — одно и то же."""
+    return [w.lower() for w in _WORD.findall(text)]
+
+
+def _find(needle: list[str], hay: list[str]) -> int:
+    """С какого слова цепочка needle стоит в hay подряд; -1 — нигде."""
+    n = len(needle)
+    if n == 0:
+        return -1
+    for i in range(len(hay) - n + 1):
+        if hay[i:i + n] == needle:
+            return i
+    return -1
+
+
 class CrossTalk:
     """
     Общее состояние двух каналов.
@@ -302,12 +405,17 @@ class CrossTalk:
     Звук собеседника из динамиков попадает в микрофон и распознаётся как речь
     пользователя — на записи это выглядит как будто он сам произнёс чужую фразу.
     Ловим это двумя способами: пока собеседник говорит, микрофону поднимаем
-    порог; а уже распознанный текст сверяем с тем, что недавно сказал собеседник.
+    порог; а уже распознанный текст сверяем с тем, что собеседник говорил
+    В ТО ЖЕ ВРЕМЯ.
     """
 
     def __init__(self) -> None:
         self._them_until = 0.0
-        self._recent: list[tuple[float, str]] = []
+        # (начало, конец звучания по time.monotonic(), текст)
+        self._recent: list[tuple[float, float, str]] = []
+        # Свежая гипотеза ещё идущей реплики собеседника: (начало, до какого
+        # момента звук вошёл в прогон, текст). Финал её придёт не скоро.
+        self._draft: tuple[float, float, str] | None = None
 
     def note_them_active(self) -> None:
         self._them_until = time.monotonic() + DUCK_HANGOVER_MS / 1000
@@ -315,57 +423,489 @@ class CrossTalk:
     def them_active(self) -> bool:
         return time.monotonic() < self._them_until
 
-    def note_them_text(self, text: str) -> None:
-        probe = text.strip().lower()
-        # Пустую реплику записывать нельзя: SequenceMatcher сравнивает с ней
-        # что угодно достаточно похоже, и микрофон пользователя глохнет на все
-        # ECHO_WINDOW_S секунд. Собеседник молчит — значит и эха нет.
-        if not probe:
+    def note_them_text(self, text: str, start: float, end: float) -> None:
+        # Пустую реплику записывать нельзя: сравнивать с ней нечего, а совпасть
+        # «по похожести» с пустотой может что угодно. Собеседник молчит — эха нет.
+        if not _words(text):
             return
         now = time.monotonic()
-        self._recent.append((now, probe))
-        self._recent = [(t, x) for t, x in self._recent if now - t < ECHO_WINDOW_S]
+        # Храним интервал ЗВУЧАНИЯ, а не момент распознавания: под нагрузкой
+        # финал приходит на секунды позже, и окно «последние 12 с» сравнивало
+        # микрофон с чем попало.
+        self._recent.append((start, end, text))
+        self._recent = [r for r in self._recent if now - r[1] < ECHO_KEEP_S]
 
-    def is_echo(self, text: str) -> bool:
-        probe = text.strip().lower()
-        if len(probe) < 6:
-            return False
-        now = time.monotonic()
-        for t, said in self._recent:
-            if now - t > ECHO_WINDOW_S:
+    def note_them_draft(self, text: str, start: float, until: float) -> None:
+        """Гипотеза идущей реплики собеседника. Пустой текст тоже знание: слов пока нет."""
+        self._draft = (start, until, text)
+
+    def drop_them_draft(self) -> None:
+        # Реплика закрылась: дальше сверяемся с её финалом, а не с черновиком.
+        self._draft = None
+
+    def draft_until(self) -> float:
+        """До какого момента звук собеседника уже распознан черновиком; 0 — черновика нет."""
+        return self._draft[1] if self._draft is not None else 0.0
+
+    def is_echo(self, text: str, start: float, end: float) -> str:
+        """Что остаётся от реплики пользователя после вычета эха. Пусто — это всё эхо.
+
+        Раньше выбрасывалась вся реплика, если в ней нашлась фраза собеседника:
+        «Ну, понятно. А что дальше делать?» пропадала целиком из-за «Понятно.»,
+        сказанного им за 10 секунд до того.
+        """
+        heard = list(self._recent)
+        if self._draft is not None and _words(self._draft[2]):
+            heard.append(self._draft)
+        for t_start, t_end, said in heard:
+            if t_start - ECHO_OVERLAP_S > end or start > t_end + ECHO_OVERLAP_S:
                 continue
-            if probe in said or said in probe:
-                return True
-            if SequenceMatcher(None, probe, said).ratio() >= ECHO_SIMILARITY:
-                return True
-        return False
+            text = self._strip(text, said)
+            if not text:
+                return ""
+        return text
+
+    @staticmethod
+    def _strip(text: str, said: str) -> str:
+        mine, theirs = _words(text), _words(said)
+        probe, heard = " ".join(mine), " ".join(theirs)
+        if len(probe) < ECHO_MIN_CHARS:
+            return text
+        # Реплика целиком внутри фразы собеседника — это его голос из динамиков.
+        if _find(mine, theirs) >= 0:
+            return ""
+        # Фраза собеседника внутри реплики: эхо и ответ пользователя попали
+        # в один буфер. Проверяем раньше похожести: «Ты меня слышишь? Да,
+        # слышу.» похожа на «Ты меня слышишь?» на 0.77 и ушла бы целиком.
+        at = _find(theirs, mine) if len(heard) >= ECHO_MIN_CHARS else -1
+        if at < 0:
+            ratio = len(probe) / max(1, len(heard))
+            if ECHO_LEN_RATIO[0] <= ratio <= ECHO_LEN_RATIO[1] and \
+                    SequenceMatcher(None, probe, heard).ratio() >= ECHO_SIMILARITY:
+                return ""
+            return text
+        # Вырезаем эхо, ответ оставляем.
+        spans = [m.span() for m in _WORD.finditer(text)]
+        left = text[:spans[at][0]].rstrip(" ,;:—–-")
+        right = text[spans[at + len(theirs) - 1][1]:].lstrip(" .,!?;:…—–-")
+        parts = [p for p in (left, right) if _words(p)]
+        # Одно слово, прилипшее к эху с краю, — скорее обрывок той же фразы,
+        # чем мысль пользователя: «Ну, понятно.» → «Ну» не нужно.
+        if len(parts) == 2:
+            sizes = [len(_words(p)) for p in parts]
+            if max(sizes) >= ECHO_REST_MIN_WORDS > min(sizes):
+                parts = [parts[sizes.index(max(sizes))]]
+        rest = " ".join(parts)
+        if len(_words(rest)) < ECHO_REST_MIN_WORDS:
+            return ""
+        return rest[0].upper() + rest[1:]
+
+
+@dataclass
+class _Final:
+    """Закрытая реплика в очереди модели. Звук — копия: буфер канала уже живёт дальше."""
+
+    pipe: "Pipeline"
+    # номер реплики в канале (Pipeline.utt на момент закрытия)
+    utt: int
+    audio: np.ndarray
+    start_ms: int
+    # интервал звучания по time.monotonic(): по нему сверяется эхо
+    began: float
+    ended: float
+    # доля реплики, прозвучавшая поверх собеседника
+    ducked: float
+    queued: float
+    # типичный уровень реплики, dBFS; None — не мерили
+    db: float | None = None
+
+
+@dataclass
+class _Partial:
+    """Просьба переспросить открытую реплику. Звук снимается при ЗАПУСКЕ прогона."""
+
+    pipe: "Pipeline"
+    utt: int
+    queued: float
 
 
 class Transcriber:
+    """Единственная очередь к модели и единственный воркер при ней.
+
+    Одна модель на оба канала: на видеокарте они подрались бы за память,
+    на процессоре — за ядра.
+
+    Раньше модель звали прямо из Pipeline.feed под общим замком. Пока шло
+    распознавание — своё или чужого канала, — обработчик микрофона не читал
+    сокет: на процессоре всегда, на видеокарте — как только прогон вместе
+    с ожиданием замка дорастал до 700 мс. Звук копился в TCP, через ~20 с
+    websockets закрывал сокет по keepalive, и голос пропадал до Стоп/Старт.
+    Теперь feed только режет реплики и ставит работу сюда: финалы идут
+    первыми и по порядку, черновики — если на них есть время.
+
+    Финал микрофона считается сразу, а отдаётся после сверки с собеседником,
+    если тот звучал тогда же (_unchecked). Раньше такой финал ждал в очереди
+    конца всей фразы собеседника: ответ, сказанный во время его длинной
+    реплики, приходил через 6–20 с, хотя модель простаивала.
+    """
+
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
-        self._lock = asyncio.Lock()
-        # сколько заняло последнее распознавание: по нему разрежаются
-        # промежуточные гипотезы, если движок не успевает
+        # сколько заняло последнее распознавание
         self.last_run_s = 0.0
+        # каналы по имени: финалу микрофона надо знать, говорит ли ещё собеседник
+        self.pipes: dict = {}
+        self._finals: deque = deque()
+        # досчитанные финалы микрофона (финал, текст), ждущие сверки с собеседником;
+        # отдаются строго по порядку, иначе строки в ленте встанут вперемешку
+        self._ready: deque = deque()
+        # не больше одной просьбы о черновике на канал
+        self._partials: dict = {}
+        self._running: _Final | _Partial | None = None
+        self._run_started = 0.0
+        # (начало, конец) недавних прогонов — для загрузки модели
+        self._busy: deque = deque()
+        # окно кодировщика, с -> скользящее среднее длительности прогона
+        self._cost: dict = {}
+        # Первая оценка — прогрев из select_engine. Отдельный холостой прогон
+        # ради замера стоил бы на процессоре ещё секунду старта.
+        warm = float(getattr(engine, "warm_up_s", 0.0) or 0.0)
+        if warm > 0:
+            self._cost[self._window(1.0)] = warm
+        self._wake: asyncio.Event | None = None
+        self._worker: asyncio.Task | None = None
+
+    @property
+    def idle_partials(self) -> bool:
+        """Черновики только в простое модели — так на процессоре (Caps.backoff > 0).
+
+        Там LocalAgreement-2 не дожидается второй гипотезы: переспрос стоит
+        секунду и больше, реплика кончается раньше. Замер: почти половина
+        времени модели уходила на черновики, из которых не показывался ни один.
+        """
+        return self.engine.caps.backoff > 0
+
+    def attach(self, pipe: "Pipeline") -> None:
+        self.pipes[pipe.channel] = pipe
 
     def set_terms(self, terms: list) -> dict:
         return self.engine.set_terms(terms)
 
-    async def run(self, audio: np.ndarray) -> str:
-        # Одна модель на оба канала: на видеокарте они подрались бы за память,
-        # на процессоре — за ядра.
-        async with self._lock:
-            started = time.monotonic()
+    def start(self) -> None:
+        """Поднять воркер. Нужен работающий event loop."""
+        if self._worker is None or self._worker.done():
+            self._wake = asyncio.Event()
+            self._worker = asyncio.get_running_loop().create_task(self._work())
+
+    async def aclose(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
             try:
-                return await asyncio.to_thread(self._sync, audio)
-            finally:
-                self.last_run_s = time.monotonic() - started
+                await self._worker
+            except BaseException:
+                pass
+            self._worker = None
+
+    # --- оценка стоимости и загрузки ---
+
+    def _window(self, audio_s: float) -> int:
+        pick = getattr(self.engine, "_cpu_window", None)
+        w = pick(audio_s) if (pick is not None and self.idle_partials) else None
+        return w or 30
+
+    def expected_cost(self, audio_s: float) -> float:
+        """Сколько, скорее всего, займёт прогон такой длины. Стоимость задаёт окно
+        кодировщика, а не длина фразы: 1.5 с и 7 с в окне 10 с стоят почти одинаково."""
+        w = self._window(audio_s)
+        if w in self._cost:
+            return self._cost[w]
+        if self._cost:
+            known = min(self._cost, key=lambda k: abs(k - w))
+            return self._cost[known] * w / known
+        return max(self.last_run_s, 0.5) * w / 10
+
+    def load(self, window_s: float, now: float | None = None) -> float:
+        """Доля времени, которую модель считала за последние window_s секунд."""
+        now = time.monotonic() if now is None else now
+        lo = now - window_s
+        busy = sum(min(e, now) - max(s, lo) for s, e in self._busy if e > lo)
+        if self._running is not None:
+            busy += now - max(self._run_started, lo)
+        return min(1.0, max(0.0, busy / window_s))
+
+    def backlog(self, channel: str | None = None) -> tuple[float, int]:
+        """Секунды звука в очереди финалов и в идущем финале; сколько финалов ждёт.
+
+        Идущий черновик не считаем: на видеокарте он переспрашивает буфер до
+        30 с каждые 700 мс, и отставание «в 25 с» пугало бы на ровном месте.
+        """
+        queued = [j for j in self._finals if channel is None or j.pipe.channel == channel]
+        samples = sum(j.audio.size for j in queued)
+        run = self._running
+        if isinstance(run, _Final) and (channel is None or run.pipe.channel == channel):
+            samples += run.audio.size
+        return samples / SAMPLE_RATE, len(queued)
+
+    def delay(self, channel: str | None = None, now: float | None = None) -> float:
+        """Сколько уже ждёт самая старая недоставленная реплика — от конца её звучания.
+
+        Это и есть отставание, которое видит пользователь. backlog меряет звук,
+        а не время: одна длинная реплика, которая просто считается, давала
+        «задержку 57 с» при финалах за 2 с.
+        """
+        now = time.monotonic() if now is None else now
+        jobs = [*self._finals, *(job for job, _ in self._ready)]
+        if isinstance(self._running, _Final):
+            jobs.append(self._running)
+        ends = [j.ended for j in jobs if channel is None or j.pipe.channel == channel]
+        return max(0.0, now - min(ends)) if ends else 0.0
+
+    # --- постановка работы (из feed, модель не ждёт) ---
+
+    def submit_final(self, pipe: "Pipeline", audio: np.ndarray, start_ms: int,
+                     began: float, ended: float, ducked: float, db: float | None = None) -> None:
+        self.start()
+        # Реплика закрыта: черновик для неё уже не нужен, финал придёт следом.
+        self._partials.pop(pipe.channel, None)
+        self._finals.append(_Final(pipe, pipe.utt, audio, start_ms, began, ended, ducked, time.monotonic(), db))
+        self._wake.set()
+
+    def offer_partial(self, pipe: "Pipeline", dur_ms: int, now: float) -> None:
+        req = self._partials.get(pipe.channel)
+        if req is not None and req.utt == pipe.utt:
+            return  # уже ждёт; звук возьмём самый свежий, когда до него дойдёт
+        run = self._running
+        if isinstance(run, _Partial) and run.pipe is pipe:
+            return  # ещё считается: следующий попросим, когда он кончится
+        every = self.engine.caps.partial_every_ms / 1000
+        if self.idle_partials:
+            # Процессор: интервал от КОНЦА прошлого прогона — он и так идёт
+            # только в простое, и частить здесь незачем.
+            if now - pipe.partial_done < every:
+                return
+            if not self._affordable(dur_ms / 1000, now):
+                return
+        else:
+            # Видеокарта: ритм от НАЧАЛА прошлого прогона, как до очереди, —
+            # 700 мс на 5060 Ti. Отсчёт от конца добавлял к ритму сам прогон,
+            # и черновиков становилось на треть меньше. Старая ловушка «прогон на
+            # каждый чанк» не вернётся: пока черновик канала считается, новый не
+            # просим (выше), feed модель не ждёт, а финалы идут вперёд черновиков.
+            # Досчитанная реплика микрофона ждёт гипотезы собеседника для сверки
+            # эха — её просим сразу, не дожидаясь ритма: иначе ответ пользователя
+            # стоял бы до следующего черновика, на 5060 Ti это до 0.7 с. На
+            # процессоре так не делаем: там прогон дольше, чем само ожидание.
+            wanted = self._draft_wanted(pipe)
+            if (now - pipe.partial_asked < every and not wanted) or (now - pipe.partial_done) * 1000 < PARTIAL_REST_MS:
+                return
+        self.start()
+        self._partials[pipe.channel] = _Partial(pipe, pipe.utt, now)
+        self._wake.set()
+
+    def _draft_wanted(self, pipe: "Pipeline") -> bool:
+        """Ждёт ли какая-нибудь досчитанная реплика микрофона свежей гипотезы этого канала."""
+        if pipe.channel != "them" or pipe.cross is None or not self._ready:
+            return False
+        until = pipe.cross.draft_until()
+        return any(until < job.ended + ECHO_DRAFT_MARGIN_S and pipe.began <= job.ended for job, _ in self._ready)
+
+    def _affordable(self, dur_s: float, now: float) -> bool:
+        """Может ли процессор сейчас потратиться на черновик."""
+        if self._running is not None or self._finals:
+            return False
+        if self.load(PARTIAL_LOAD_WINDOW_S, now) >= PARTIAL_LOAD_MAX:
+            return False
+        # Гипотеза, которая досчитается уже после принудительного закрытия
+        # реплики, не нужна: финал всё равно придёт следом, а время он ждал бы.
+        return (dur_s + self.expected_cost(dur_s)) * 1000 < self.engine.caps.max_utterance_ms
+
+    # --- воркер ---
+
+    @staticmethod
+    def _overlap(a: _Final, b: _Final) -> bool:
+        """Звучали ли две реплики одновременно.
+
+        Пересечение строгое, без запаса ECHO_OVERLAP_S: эхо не может начаться
+        раньше оригинала. С запасом вопрос пользователя, на который собеседник
+        ответил через секунду, ждал бы конца всего ответа.
+        """
+        return a.began <= b.ended and a.ended >= b.began
+
+    def _unchecked(self, job: _Final, text: str, now: float) -> bool:
+        """Рано ли отдавать досчитанный финал микрофона: собеседник звучал тогда
+        же, а его слова ещё неизвестны, и эхо прошло бы в расшифровку строкой «Я»."""
+        if job.pipe.channel != "me" or job.pipe.cross is None or not text:
+            return False
+        if now - job.ended >= ECHO_WAIT_S:
+            return False
+        # Реплика собеседника уже закрыта и стоит в очереди или считается —
+        # ждём её финала: это один прогон, и _pick_final пустит его первым.
+        for other in (*self._finals, self._running):
+            if isinstance(other, _Final) and other.pipe.channel == "them" and self._overlap(other, job):
+                return True
+        them = self.pipes.get("them")
+        if them is None or not them.speaking or them.began > job.ended:
+            return False
+        # Ещё говорит: хватит гипотезы, в которую вошёл конец нашей речи. Даже
+        # если он уже замолкает — ждать финала ради того же текста значило бы
+        # добавить к ответу пользователя секунду: так и было на 5060 Ti, когда
+        # обе стороны договаривали длинные реплики почти одновременно.
+        if job.pipe.cross.draft_until() >= job.ended + ECHO_DRAFT_MARGIN_S:
+            return False
+        return now - job.ended < ECHO_OPEN_WAIT_S
+
+    async def _flush(self, now: float) -> None:
+        """Отдать досчитанные финалы микрофона, для которых сверка уже возможна."""
+        while self._ready:
+            job, text = self._ready[0]
+            if self._unchecked(job, text, now):
+                return
+            self._ready.popleft()
+            try:
+                await job.pipe._deliver_final(job, text)
+            except Exception as e:
+                log_error(f"{job.pipe.channel}: {e}")
+
+    def _shed(self, now: float) -> list[_Final]:
+        me = [j for j in self._finals if j.pipe.channel == "me"]
+        total = sum(j.audio.size for j in me) / SAMPLE_RATE
+        if len(me) < 2 or total <= SHED_ME_BACKLOG_S or now - me[0].queued < SHED_WAIT_S:
+            return []
+        own = me[0].pipe.own_level()
+        if own is None:
+            return []  # не с чем сравнить громкость — не выбрасываем ничего
+        # Финалы собеседника не трогаем никогда: на них отвечает подсказчик.
+        # Выбрасываем с самых старых и ровно столько, чтобы очередь вернулась
+        # под порог: каждая лишняя выброшенная реплика может оказаться речью.
+        drop = []
+        for j in me:
+            if total <= SHED_ME_BACKLOG_S:
+                break
+            if j.ducked >= SHED_DUCKED_SHARE and j.db is not None and j.db <= own - SHED_QUIET_DB:
+                drop.append(j)
+                total -= j.audio.size / SAMPLE_RATE
+        for j in drop:
+            self._finals.remove(j)
+        return drop
+
+    def _pick_final(self, now: float) -> _Final:
+        """Какой финал считать следующим. По порядку закрытия, с одним исключением.
+
+        Финал собеседника идёт раньше реплик микрофона, если те всё равно ждали бы
+        его для сверки (звучали одновременно) или если модель отстаёт, а они
+        прозвучали в основном поверх собеседника. Реплику, сказанную не поверх
+        него, финал собеседника не обгоняет никогда — кроме случая, когда его ждёт
+        уже досчитанная реплика микрофона: та закрылась раньше всей очереди.
+        """
+        head = self._finals[0]
+        if head.pipe.channel != "me":
+            return head
+        them = [j for j in self._finals if j.pipe.channel == "them"]
+        for t in them:
+            if any(self._overlap(t, job) for job, _ in self._ready):
+                return t
+        lagging = now - head.queued >= THEM_FIRST_WAIT_S
+        for job in self._finals:
+            if job.pipe.channel == "them":
+                return job
+            waits = any(self._overlap(t, job) for t in them)
+            if not (waits or (lagging and job.ducked >= ECHO_LIKELY_DUCKED)):
+                break
+        return head
+
+    def _next(self, now: float) -> _Final | _Partial | None:
+        if self._finals:
+            job = self._pick_final(now)
+            self._finals.remove(job)
+            return job
+        while self._partials:
+            ch = min(self._partials, key=lambda c: self._partials[c].queued)
+            req = self._partials.pop(ch)
+            pipe = req.pipe
+            if req.utt != pipe.utt or not pipe.speaking or not pipe.buf:
+                continue  # реплика уже закрыта
+            if self.idle_partials and not self._affordable(pipe.samples / SAMPLE_RATE, now):
+                continue  # пока ждала, появилась работа поважнее; feed попросит снова
+            return req
+        return None
+
+    async def _work(self) -> None:
+        while True:
+            try:
+                now = time.monotonic()
+                await self._flush(now)
+                for job in self._shed(now):
+                    await job.pipe._drop_final(job)
+                job = self._next(now)
+                if job is None:
+                    self._wake.clear()
+                    try:
+                        # Финалы, ждущие сверки, надо пересматривать и без
+                        # внешнего повода: срок ожидания истекает сам.
+                        await asyncio.wait_for(self._wake.wait(), HOLD_RECHECK_S if self._ready else None)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                await self._execute(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Воркер один на оба канала: если он умрёт, распознавание встанет
+                # целиком и молча. Пишем и живём дальше.
+                log_error(f"очередь распознавания: {type(e).__name__}: {e}")
+                await asyncio.sleep(0.1)
+
+    async def _execute(self, job: _Final | _Partial) -> None:
+        pipe = job.pipe
+        final = isinstance(job, _Final)
+        # Черновик считаем по звуку на момент запуска: он самый свежий.
+        audio = job.audio if final else np.concatenate(pipe.buf)
+        self._running = job
+        started = self._run_started = time.monotonic()
+        if not final:
+            pipe.partial_runs += 1
+            # Ритм — от просьбы, которая привела к прогону: feed просит на границе
+            # чанка, а воркер стартует на миллисекунды позже, и отсчёт от старта
+            # сдвигал бы каждый следующий черновик на целый чанк, 50 мс.
+            pipe.partial_asked = job.queued
+        text, failed = "", False
+        try:
+            text = await asyncio.to_thread(self._sync, audio)
+        except Exception as e:
+            # CUDA out of memory, cuBLAS после сброса драйвера и прочее: реплику
+            # теряем, канал — нет. Раньше такое исключение закрывало сокет
+            # микрофона, и голос пропадал до конца сессии.
+            failed = True
+            log_error(f"{pipe.channel}: {e}")
+        finally:
+            ended = time.monotonic()
+            self._running = None
+            self.last_run_s = ended - started
+            self._busy.append((started, ended))
+            while self._busy and self._busy[0][1] < ended - LOAD_WINDOW_S:
+                self._busy.popleft()
+            if not failed:
+                w = self._window(audio.size / SAMPLE_RATE)
+                old = self._cost.get(w)
+                self._cost[w] = self.last_run_s if old is None else old + COST_EMA * (self.last_run_s - old)
+            if not final:
+                pipe.partial_done = ended
+        try:
+            if final and pipe.channel == "me" and (self._ready or self._unchecked(job, text, ended)):
+                # Сверять эхо ещё не с чем, или раньше ждёт своей сверки прошлая
+                # реплика. Модель при этом свободна для остального.
+                self._ready.append((job, text))
+            elif final:
+                await pipe._deliver_final(job, text)
+            elif not failed:
+                await pipe._deliver_partial(job.utt, text, started)
+        except Exception as e:
+            log_error(f"{pipe.channel}: {e}")
 
     def _sync(self, audio: np.ndarray) -> str:
         text, span = self.engine.transcribe(audio)
         # Длительность нужна фильтру, чтобы поймать неправдоподобный темп речи.
-        return "" if looks_like_noise(text, span) else text
+        return "" if looks_like_noise(text, span, audio.size / SAMPLE_RATE) else text
 
 
 @dataclass
@@ -381,10 +921,11 @@ class Pipeline:
     buf: list = field(default_factory=list)
     samples: int = 0
     start_ms: int = 0
+    # когда в реплике услышана речь, по time.monotonic()
+    began: float = 0.0
     speaking: bool = False
     silence_ms: int = 0
     hangover_ms: int = 0
-    last_partial: float = 0.0
     last_level: float = 0.0
     prev_hyp: str = ""
     shown: str = ""
@@ -402,18 +943,77 @@ class Pipeline:
     # получило бы устаревшее решение.
     gate_debt: int = 0
     gate_says: bool = False
+    # Номер реплики: черновик, досчитанный для уже закрытой, выбрасывается.
+    utt: int = 0
+    # сколько сэмплов реплики прозвучало, пока говорил собеседник, и сколько
+    # в ней подклеенного пред-ролла: его в долю не считаем ни туда, ни сюда
+    ducked_samples: int = 0
+    pre_used: int = 0
+    # когда попросили прошлый прогон черновика этого канала и когда он кончился
+    partial_asked: float = 0.0
+    partial_done: float = 0.0
+    # Уровни речи текущей реплики и голоса без собеседника, dBFS. Сброс
+    # нагрузки по ним отличает тихое эхо из динамиков от пользователя,
+    # который говорит поверх собеседника обычным голосом.
+    utt_db: list = field(default_factory=list)
+    own_db: deque = field(default_factory=lambda: deque(maxlen=500))
+    # --- для stats ---
+    lag_max: float = 0.0
+    partial_runs: int = 0
+    partials_shown: int = 0
+    echo_dropped: int = 0
+    empty_finals: int = 0
+
+    def __post_init__(self) -> None:
+        attach = getattr(self.transcriber, "attach", None)
+        if attach is not None:
+            attach(self)
 
     def reset(self) -> None:
         # Кольцо пред-ролла НЕ трогаем: оно наполняется в тишине между
         # репликами и нужно уже следующей.
-        self.buf.clear()
+        self.utt += 1
+        # Новый список, а не clear(): закрытая реплика уже скопирована в финал,
+        # и ничто не должно увидеть, как её буфер меняется.
+        self.buf = []
         self.samples = 0
         self.speaking = False
         self.silence_ms = 0
         self.prev_hyp = ""
         self.shown = ""
+        self.ducked_samples = 0
+        self.pre_used = 0
+        self.utt_db = []
+        if self.channel == "them" and self.cross is not None:
+            self.cross.drop_them_draft()
 
-    async def feed(self, chunk: np.ndarray) -> None:
+    def own_level(self) -> float | None:
+        """Обычный уровень голоса на канале, пока собеседник молчит; None — мало замеров."""
+        if len(self.own_db) < OWN_LEVEL_MIN_SAMPLES:
+            return None
+        return float(np.median(np.fromiter(self.own_db, dtype=np.float32)))
+
+    def restart(self) -> None:
+        """Звук пошёл заново: переподключился микрофон или его сокет закрылся.
+
+        Недосказанная реплика и пред-ролл принадлежат старому потоку. Если их
+        оставить, новый поток продолжит чужую реплику с середины.
+        """
+        self.reset()
+        self.pre.clear()
+        self.pre_samples = 0
+        self.win.clear()
+        self.win_samples = 0
+        self.hangover_ms = 0
+        self.gate_debt = 0
+        self.gate_says = False
+
+    async def feed(self, chunk: np.ndarray, arrived: float | None = None) -> None:
+        """Режет звук на реплики. Модель здесь не ждём никогда — см. Transcriber.
+
+        arrived — когда чанк пришёл в процесс, по time.monotonic(): по нему
+        считается задержка чтения для stats.
+        """
         chunk_ms = int(chunk.size / SAMPLE_RATE * 1000)
         level = rms_dbfs(chunk)
 
@@ -466,6 +1066,10 @@ class Pipeline:
         if (now_l - self.last_level) * 1000 >= LEVEL_EVERY_MS:
             self.last_level = now_l
             self.levels.note(level, active)
+            if active:
+                self.utt_db.append(level)
+                if not ducked:
+                    self.own_db.append(level)
             await self.emit("level", self.channel, "", 0, level)
 
         # Клиппинг: если собеседник в красной зоне, дело не в тихом микрофоне,
@@ -479,16 +1083,25 @@ class Pipeline:
             # уровень перешёл порог.
             self.buf.extend(self.pre)
             self.samples += self.pre_samples
+            self.pre_used = self.pre_samples
             pre_ms = int(self.pre_samples / SAMPLE_RATE * 1000)
-            # Не уходим в минус: у самого начала сессии пред-ролл длиннее,
-            # чем всё прошедшее время, а отрицательная метка ломает ленту.
-            self.start_ms = max(0, int((time.monotonic() - self.t0) * 1000) - pre_ms)
+            # Время реплики — по приходу звука сюда: feed больше не ждёт модель
+            # и идёт вровень с речью. Не уходим в минус: у самого начала сессии
+            # пред-ролл длиннее, чем всё прошедшее время, а отрицательная метка
+            # ломает ленту.
+            now_s = time.monotonic()
+            self.start_ms = max(0, int((now_s - self.t0) * 1000) - pre_ms)
+            # Звучание — с момента, когда речь услышана, без пред-ролла: тот
+            # подклеен про запас и сдвигал бы начало на 0.4 с раньше речи.
+            self.began = now_s
             self.pre.clear()
             self.pre_samples = 0
 
         if self.speaking:
             self.buf.append(chunk)
             self.samples += chunk.size
+            if ducked:
+                self.ducked_samples += chunk.size
             self.silence_ms = 0 if active else self.silence_ms + chunk_ms
         else:
             # Молчим — копим кольцо, чтобы было что подклеить.
@@ -501,37 +1114,23 @@ class Pipeline:
         dur_ms = int(self.samples / SAMPLE_RATE * 1000)
         now = time.monotonic()
         caps = self.transcriber.engine.caps
-        # Пока идёт распознавание, канал не читает звук: захват копится в очереди.
-        # Если процессор слабый или реплика длинная, переспрос по расписанию съел
-        # бы всё время, и очередь переполнилась бы. Поэтому на процессоре между
-        # гипотезами выдерживается несколько длительностей последнего распознавания.
-        partial_gap_ms = max(caps.partial_every_ms, self.transcriber.last_run_s * 1000 * caps.backoff)
 
-        # Гипотеза, которая досчитается уже после принудительного закрытия реплики,
-        # не нужна: финал всё равно придёт следом, а на процессоре она отнимает
-        # секунду, пока звук копится в очереди. На CUDA (backoff 0) не трогаем.
-        near_cut = caps.backoff > 0 and dur_ms + self.transcriber.last_run_s * 1000 >= caps.max_utterance_ms
-
-        if (self.speaking and dur_ms >= max(MIN_UTTERANCE_MS, caps.min_partial_ms) and not near_cut
-                and (now - self.last_partial) * 1000 >= partial_gap_ms):
-            self.last_partial = now
-            hyp = await self.transcriber.run(np.concatenate(self.buf))
-            stable = common_prefix(self.prev_hyp, hyp)
-            self.prev_hyp = hyp
-            if stable and stable != self.shown:
-                self.shown = stable
-                await self.emit("partial", self.channel, stable, self.start_ms)
+        if self.speaking and dur_ms >= max(MIN_UTTERANCE_MS, caps.min_partial_ms):
+            self.transcriber.offer_partial(self, dur_ms, now)
 
         endpoint = ENDPOINT_SILERO_MS if self.gate is not None else ENDPOINT_MS
         if self.speaking and (self.silence_ms >= endpoint or dur_ms >= caps.max_utterance_ms):
-            # reset() обязан выполниться в любом случае: если распознавание
+            # reset() обязан выполниться в любом случае: если постановка финала
             # бросит исключение, а буфер останется, канал больше никогда не
             # закроет реплику — он будет расти и переспрашиваться целиком.
             # Потерять одну реплику дешевле, чем потерять канал.
             try:
-                await self._finish(dur_ms)
+                self._finish(dur_ms, now)
             finally:
                 self.reset()
+
+        if arrived is not None:
+            self.lag_max = max(self.lag_max, time.monotonic() - arrived)
 
     def _voiced(self) -> np.ndarray:
         """Буфер реплики без хвоста тишины, накопленного эндпойнтом.
@@ -549,21 +1148,86 @@ class Pipeline:
             return audio
         return audio[:-drop]
 
-    async def _finish(self, dur_ms: int) -> None:
+    def _finish(self, dur_ms: int, now: float) -> None:
+        """Поставить закрытую реплику в очередь. Модель не ждём."""
         if dur_ms < MIN_UTTERANCE_MS:
             return
-        # Считаем только то, что реально ушло в модель: обрывки короче
+        # Считаем только то, что реально уходит в модель: обрывки короче
         # MIN_UTTERANCE_MS отбрасываются, и в счётчике им не место — иначе
         # цифра врёт в разы, а на неё смотрят как на диагностику.
         self.levels.utterances += 1
-        text = await self.transcriber.run(self._voiced())
+        audio = self._voiced()
+        self.transcriber.submit_final(
+            self, audio, self.start_ms, self.began,
+            # конец звучания, а не момент закрытия: эндпойнт ещё ждал тишину
+            now - self.silence_ms / 1000,
+            # Без пред-ролла: это тишина до речи, и чистое эхо на 8 с набирало
+            # долю «поверх собеседника» только 0.79 — ниже порога сброса нагрузки.
+            self.ducked_samples / max(1, self.samples - self.pre_used),
+            # Верхняя четверть, а не среднее: паузы между словами тянули бы
+            # уровень вниз, и обычная речь выглядела бы тихим эхом.
+            float(np.percentile(self.utt_db, 75)) if self.utt_db else rms_dbfs(audio),
+        )
+
+    async def _deliver_partial(self, utt: int, hyp: str, at: float | None = None) -> None:
+        """at — когда начался прогон: звук реплики до этого момента в гипотезу вошёл."""
+        if utt != self.utt or not self.speaking:
+            return  # реплика закрылась, пока считался черновик: финал уже в очереди
+        if self.channel == "them" and self.cross is not None:
+            # Финал идущей реплики собеседника может прийти через полминуты,
+            # а сверять с ней эхо микрофона надо уже сейчас.
+            self.cross.note_them_draft(hyp, self.began, time.monotonic() if at is None else at)
+        if self.transcriber.idle_partials:
+            # Второй гипотезы на процессоре не дождаться — показываем первую.
+            stable = hyp
+        else:
+            stable = common_prefix(self.prev_hyp, hyp)
+            self.prev_hyp = hyp
+        if stable and stable != self.shown:
+            self.shown = stable
+            self.partials_shown += 1
+            await self.emit("partial", self.channel, stable, self.start_ms)
+
+    async def _deliver_final(self, job: _Final, text: str) -> None:
         if self.cross is not None:
             if self.channel == "them":
-                self.cross.note_them_text(text)
-            elif text and self.cross.is_echo(text):
-                # Это не пользователь, это динамики. Молча выбрасываем.
-                text = ""
-        await self.emit("final", self.channel, text, self.start_ms)
+                self.cross.note_them_text(text, job.began, job.ended)
+            elif text:
+                kept = self.cross.is_echo(text, job.began, job.ended)
+                if not kept:
+                    # Это не пользователь, это динамики.
+                    self.echo_dropped += 1
+                text = kept
+        await self._emit_final(text, job.start_ms)
+
+    async def _drop_final(self, job: _Final) -> None:
+        """Реплика выброшена без прогона при сбросе нагрузки — почти наверняка эхо."""
+        self.echo_dropped += 1
+        await self._emit_final("", job.start_ms)
+
+    async def _emit_final(self, text: str, start_ms: int) -> None:
+        # Пустой финал тоже отправляем: он значит «реплика закрыта, строки нет».
+        # Без него черновик этой реплики оставался на экране навсегда.
+        if not text:
+            self.empty_finals += 1
+        await self.emit("final", self.channel, text, start_ms)
+
+    def report(self, detector: str) -> dict:
+        """Уровни плюс здоровье очереди для stats. Задержку чтения копим до отчёта."""
+        backlog, queued = self.transcriber.backlog(self.channel)
+        out = self.levels.report(self.vad_threshold, detector)
+        out.update({
+            "lagS": round(self.lag_max, 2),
+            "backlogS": round(backlog, 1),
+            "delayS": round(self.transcriber.delay(self.channel), 1),
+            "queuedFinals": queued,
+            "partialRuns": self.partial_runs,
+            "partialsShown": self.partials_shown,
+            "echoDropped": self.echo_dropped,
+            "emptyFinals": self.empty_finals,
+        })
+        self.lag_max = 0.0
+        return out
 
 
 class Hub:
@@ -579,7 +1243,9 @@ class Hub:
         self.clients.get(channel, set()).discard(ws)
 
     async def send(self, kind: str, channel: str, text: str, start_ms: int, db: float | None = None) -> None:
-        if kind != "level" and not text:
+        # Пустой черновик ничего не значит, а пустой финал значит «реплика
+        # закрыта, строки нет, убери черновик» — его отправляем всегда.
+        if kind == "partial" and not text:
             return
         msg: dict = {"type": kind, "channel": channel, "text": text, "startMs": start_ms}
         if db is not None:
@@ -591,6 +1257,15 @@ class Hub:
             except Exception:
                 self.drop(channel, ws)
 
+    async def broadcast(self, payload: str) -> None:
+        """Во все открытые сокеты, какого бы канала они ни были."""
+        for channel, sockets in list(self.clients.items()):
+            for ws in list(sockets):
+                try:
+                    await ws.send(payload)
+                except Exception:
+                    self.drop(channel, ws)
+
 
 def fatal(code: str, message: str) -> None:
     """Последнее слово перед выходом: приложение покажет message вместо трассировки."""
@@ -599,6 +1274,10 @@ def fatal(code: str, message: str) -> None:
 
 def log_error(message: str) -> None:
     print(json.dumps({"error": message}, ensure_ascii=False), flush=True)
+
+
+def log_event(name: str, **fields) -> None:
+    print(json.dumps({"event": name, **fields}, ensure_ascii=False), flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -639,21 +1318,24 @@ async def main(args: argparse.Namespace) -> None:
     mic = Pipeline("me", transcriber, hub.send, t0, cross=cross,
                    vad_threshold=VAD_RMS_DBFS_MIC, gate=gate)
     sys_pipe = Pipeline("them", transcriber, hub.send, t0, cross=cross, gate=gate)
+    transcriber.start()
 
     # Системный звук: поток PyAudio -> очередь -> обработчик в event loop.
     sys_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
-    def push(chunk: np.ndarray) -> None:
-        # Переполнение значит, что распознавание не успевает за захватом.
+    def push(chunk: np.ndarray, arrived: float) -> None:
+        # Переполнение значит, что обработка не успевает за захватом.
         # Раньше чанк выбрасывался молча — то есть кусок чужой речи пропадал,
         # и понять это по расшифровке было нельзя. Теперь считаем.
         if sys_queue.full():
             sys_pipe.levels.dropped += 1
             return
-        sys_queue.put_nowait(chunk)
+        sys_queue.put_nowait((chunk, arrived))
 
     def on_loopback(chunk: np.ndarray) -> None:
-        loop.call_soon_threadsafe(push, chunk)
+        # Время прихода берём в потоке захвата: так в lagS попадает и ожидание
+        # в очереди, и задержка самого event loop.
+        loop.call_soon_threadsafe(push, chunk, time.monotonic())
 
     from audio_loopback import LoopbackCapture
 
@@ -662,9 +1344,9 @@ async def main(args: argparse.Namespace) -> None:
 
     async def drain_system_audio() -> None:
         while True:
-            chunk = await sys_queue.get()
+            chunk, arrived = await sys_queue.get()
             try:
-                await sys_pipe.feed(chunk)
+                await sys_pipe.feed(chunk, arrived)
             except Exception as e:
                 print(json.dumps({"error": "them: " + str(e)}), flush=True)
 
@@ -677,21 +1359,61 @@ async def main(args: argparse.Namespace) -> None:
 
         Это единственный способ обсуждать качество звука цифрами: где пол
         шума, насколько речь его превышает и остаётся ли запас над порогом,
-        за которым реплика вообще попадает в модель.
+        за которым реплика вообще попадает в модель. Там же — успевает ли
+        модель: задержка чтения, очередь финалов, судьба черновиков и эха.
         """
         while True:
             await asyncio.sleep(STATS_EVERY_S)
             print(
                 json.dumps({
                     "stats": {
-                        "me": mic.levels.report(mic.vad_threshold, detector),
-                        "them": sys_pipe.levels.report(sys_pipe.vad_threshold, detector),
+                        "me": mic.report(detector),
+                        "them": sys_pipe.report(detector),
+                        "modelLoad": round(transcriber.load(LOAD_WINDOW_S), 2),
                     }
                 }, ensure_ascii=False),
                 flush=True,
             )
 
     asyncio.create_task(report_levels())
+
+    async def report_health() -> None:
+        """Раз в HEALTH_EVERY_S — во все сокеты: успевает ли распознавание.
+
+        Отставание раньше было видно только по тому, что строки перестали
+        приходить. Теперь приложение может сказать об этом словами.
+        """
+        device = "cuda" if getattr(engine, "device", "cpu") == "cuda" else "cpu"
+        while True:
+            await asyncio.sleep(HEALTH_EVERY_S)
+            backlog, queued = transcriber.backlog()
+            await hub.broadcast(json.dumps({
+                "type": "health",
+                "device": device,
+                "load": round(transcriber.load(LOAD_WINDOW_S), 2),
+                # секунды звука в очереди — для диагностики
+                "backlogS": round(backlog, 1),
+                # сколько ждёт самая старая реплика — это приложение и показывает
+                "delayS": round(transcriber.delay(), 1),
+                "queuedFinals": queued,
+            }))
+
+    asyncio.create_task(report_health())
+
+    async def watch_loop() -> None:
+        """Насколько event loop опаздывает к своим задачам.
+
+        Сокет микрофона читается в том же loop. Время, которое кадр пролежал
+        в TCP до чтения, изнутри не увидеть, а вот сам затык loop — видно:
+        он и задержал бы чтение. Поэтому его опоздание идёт в lagS микрофона.
+        """
+        while True:
+            started = time.monotonic()
+            await asyncio.sleep(LOOP_TICK_S)
+            late = time.monotonic() - started - LOOP_TICK_S
+            mic.lag_max = max(mic.lag_max, late)
+
+    asyncio.create_task(watch_loop())
 
     async def on_control(ws, raw: str) -> None:
         """Текстовые кадры — управление; звук идёт бинарными.
@@ -712,24 +1434,60 @@ async def main(args: argparse.Namespace) -> None:
         info = transcriber.set_terms(terms[:300])
         await ws.send(json.dumps({"type": "hotwords", **info}, ensure_ascii=False))
 
+    # Микрофон один. Когда рендерер переподключается, старый сокет может ещё
+    # жить, и два обработчика кормили бы один Pipeline вперемешку.
+    current_mic: dict = {"ws": None}
+
     async def handle(ws) -> None:
         q = parse_qs(urlparse(ws.request.path).query)
         if q.get("token", [""])[0] != args.token:
             await ws.close(code=4001, reason="unauthorized")
             return
         channel = q.get("ch", ["them"])[0]
+        if channel == "me":
+            old = current_mic["ws"]
+            current_mic["ws"] = ws
+            if old is not None:
+                hub.drop("me", old)
+                mic.restart()
+                log_event("mic-replaced")
+                # Не ждём закрытия здесь: старый клиент может не ответить на
+                # close, а новому нужно начинать сразу. 4002 — рендерер знает,
+                # что это он сам переподключился, и не переподключается снова.
+                asyncio.create_task(old.close(code=4002, reason="replaced"))
         hub.add(channel, ws)
         try:
             async for raw in ws:
                 if isinstance(raw, str):
-                    await on_control(ws, raw)
+                    try:
+                        await on_control(ws, raw)
+                    except Exception as e:
+                        # Словарь не применился — это не повод рвать соединение.
+                        log_error(f"{channel}: управляющее сообщение не обработано: {e}")
                     continue
                 # Собеседника захватываем сами; от клиента ждём только микрофон.
-                if channel != "me":
+                # Сокет, который уже заменён новым, дочитываем вхолостую до закрытия.
+                if channel != "me" or current_mic["ws"] is not ws:
                     continue
-                await mic.feed(np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0)
+                arrived = time.monotonic()
+                try:
+                    await mic.feed(np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0, arrived)
+                except Exception as e:
+                    # Раньше любое исключение здесь закрывало сокет микрофона,
+                    # а рендерер не переподключался: голос пропадал до Стоп/Старт,
+                    # хотя тот же сбой на канале собеседника просто логировался.
+                    log_error(f"me: {e}")
+                    mic.reset()
+        except websockets.ConnectionClosed:
+            pass
         finally:
             hub.drop(channel, ws)
+            if channel == "me" and current_mic["ws"] is ws:
+                current_mic["ws"] = None
+                mic.restart()
+            # Закрытие сокета раньше не оставляло следа нигде, кроме stderr,
+            # который в сессии никто не видит.
+            log_event("ws-closed", channel=channel, code=ws.close_code, reason=ws.close_reason)
 
     # Ждём, пока поток захвата сообщит устройство или ошибку.
     await asyncio.sleep(0.6)
@@ -749,7 +1507,10 @@ async def main(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    async with websockets.serve(handle, "127.0.0.1", args.port, max_size=2 ** 20):
+    # Keepalive выключен: соединение локальное, искать обрыв сети незачем, а
+    # при затыке чтения понг застревал за кадрами звука, и websockets закрывал
+    # сокет микрофона кодом 1011. Чтение теперь модель не ждёт.
+    async with websockets.serve(handle, "127.0.0.1", args.port, max_size=2 ** 20, ping_interval=None):
         await asyncio.Future()
 
 

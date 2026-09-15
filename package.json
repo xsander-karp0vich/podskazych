@@ -1,6 +1,6 @@
 {
   "name": "call-copilot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Личный ассистент для созвонов и демо: локальный транскрипт и подсказки из встроенной базы вопросов",
   "main": "out/main/index.js",
   "private": true,

@@ -176,6 +176,8 @@ const api = {
   startStt: (opts: { language?: string; glossary?: string }): Promise<SttStartResult> =>
     ipcRenderer.invoke('stt:start', opts),
   stopStt: (): Promise<void> => ipcRenderer.invoke('stt:stop'),
+  /** Сайдкар завершился сам посреди сессии: переподключаться клиенту больше не к чему. */
+  onSttExit: (cb: (p: { error: string }) => void) => subscribe<{ error: string }>('stt:exit', cb),
 
   // скриншот
   listScreens: (): Promise<Array<{ id: string; label: string; primary: boolean }>> =>
