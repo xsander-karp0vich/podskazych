@@ -94,6 +94,8 @@ def wait_pid_exit(pid, timeout_s):
 
 
 def main():
+    # консоль раннера в cp1252: без этого первый же русский print падает
+    sys.stdout.reconfigure(encoding="utf-8")
     exe = os.path.abspath(sys.argv[1])
     print("exe:", exe, os.path.getsize(exe), "байт")
 
@@ -176,15 +178,24 @@ def main():
     check(h2.proc.wait(timeout=60) == 0, "EOF на stdin -> выход с кодом 0")
 
     # --- родитель убит -> помощник выходит сам ---
+    # Пишущий конец stdin помощника держим здесь, а не в убиваемом родителе: иначе
+    # помощник вышел бы по EOF и наблюдение за PID осталось бы непроверенным.
+    import msvcrt
+    r, w = os.pipe()
+    rh = msvcrt.get_osfhandle(r)
+    os.set_handle_inheritable(rh, True)
     launcher = (
-        "import subprocess, sys, os, time\n"
+        "import msvcrt, subprocess, sys, os, time\n"
+        "fd = msvcrt.open_osfhandle(int(sys.argv[2]), os.O_RDONLY)\n"
         "p = subprocess.Popen([sys.argv[1], '--parent-pid', str(os.getpid())],"
-        " stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)\n"
+        " stdin=fd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)\n"
+        "os.close(fd)\n"
         "p.stdout.readline()\n"
         "print(p.pid, flush=True)\n"
         "time.sleep(600)\n"
     )
-    parent = subprocess.Popen([sys.executable, "-c", launcher, exe], stdout=subprocess.PIPE)
+    parent = subprocess.Popen([sys.executable, "-c", launcher, exe, str(rh)], stdout=subprocess.PIPE, close_fds=False)
+    os.close(r)
     helper_pid = int(parent.stdout.readline().strip())
     time.sleep(0.5)
     t_kill = time.monotonic()
@@ -192,7 +203,8 @@ def main():
     parent.wait()
     exited = wait_pid_exit(helper_pid, 10)
     dt = time.monotonic() - t_kill
-    check(exited, f"помощник вышел после смерти родителя ({dt:.2f} с)")
+    check(exited and dt < 5, f"помощник вышел после смерти родителя ({dt:.2f} с)")
+    os.close(w)
 
     print("stderr помощника (хвост):")
     print(h.stderr.decode("utf-8", "replace")[-3000:])
