@@ -62,20 +62,64 @@ stdin и stdout — двоичный протокол ниже. **stderr — т�
 
 ### 1. hello (сразу после запуска)
 
+Значения в примере условные.
+
 ```json
 {"type":"hello","version":"1.9.4","protocol":1,
- "devices":[{"index":0,"name":"AMD Radeon RX 5700 XT","type":"discrete","vramMB":8176,"freeMB":7900}],
+ "devices":[{"index":0,"name":"AMD Radeon RX 5700 XT","type":"discrete","vramMB":8176,"freeMB":7900,
+   "vendorId":4098,"deviceId":29471,"driverId":1,"driverName":"AMD proprietary driver",
+   "driverInfo":"24.9.1 (AMD proprietary shader compiler)","driverVersion":"2.0.302",
+   "driverVersionRaw":8388910,"apiVersion":"1.3.260","architecture":"amd-rdna1",
+   "uma":false,"coopmat":false,"coopmat2":false,"integerDotProduct":true,"fp16":true}],
  "cpuOk":true,"vulkanLoader":true}
 ```
 
 - `devices` — только устройства Vulkan типа GPU/IGPU из реестра ggml. `index` — тот же
   счёт, что `gpu_device` в whisper.cpp. `type`: `discrete`, `integrated` или `other`
   (Vulkan поверх Direct3D 12 и подобные прослойки; сами их не выбираем).
-- `vramMB` для встроенной графики — доступная ей общая память.
+- `vramMB` для встроенной графики — доступная ей общая память. `freeMB` не меняется, пока
+  жив процесс, и занятость видеопамяти другими программами не показывает.
 - `cpuOk: false` — процессор без AVX2/FMA/F16C/BMI2, эта сборка на нём работать не будет.
 - `vulkanLoader: false` — в System32 нет `vulkan-1.dll` (драйвер без Vulkan) или это
   загрузчик Vulkan 1.0 без нужных функций (все отложенные импорты связываются до hello).
 - Перечисление устройств может занять до пары секунд.
+
+Подробности устройства — чтобы сайдкар решал про flash attention и уровень ускорения не
+по имени карты. Помощник спрашивает драйвер сам (отдельный экземпляр Vulkan,
+`vkGetPhysicalDeviceProperties2`/`vkGetPhysicalDeviceFeatures2`) и повторяет проверки
+ggml-vulkan v1.9.4. **Поля идут все сразу или ни одного**: их нет, если драйвер не
+ответил, упал внутри запроса или устройство не удалось однозначно сопоставить с номером
+ggml (по порядку выбора устройств ggml, имени и PCI-адресу). Помощник при этом не падает,
+причина — в stderr.
+
+| поле | что это |
+|------|---------|
+| `vendorId`, `deviceId` | PCI-коды: `4098` = 0x1002 AMD, `32902` = 0x8086 Intel, `4318` = 0x10DE NVIDIA |
+| `driverId` | `VkDriverId`: 1 — фирменный AMD, 2 — AMDVLK, 3 — RADV, 4 — NVIDIA, 5 — Intel Windows, 6 — Intel Mesa, 23 — Dozen |
+| `driverName`, `driverInfo` | строки драйвера; у AMD и NVIDIA в `driverInfo` версия пакета драйвера (`24.9.1`, `581.29`) |
+| `driverVersion` | версия драйвера строкой по правилам вендора: NVIDIA `581.29`, Intel на Windows `101.6130`, остальные `major.minor.patch` |
+| `driverVersionRaw` | то же число из `VkPhysicalDeviceProperties.driverVersion` как есть |
+| `apiVersion` | версия Vulkan, которую поддерживает устройство |
+| `architecture` | поколение по правилам ggml (`get_device_architecture`): `amd-gcn` (Polaris/Vega), `amd-rdna1`, `amd-rdna2`, `amd-rdna3`, `intel-xe1`, `intel-xe2`, `nvidia-pre-turing`, `nvidia-turing`, иначе `other` (в том числе NVIDIA новее Turing) |
+| `uma` | встроенная графика с общей памятью |
+| `coopmat` | ggml использует `VK_KHR_cooperative_matrix`: расширение и функция есть, не выключено `GGML_VK_DISABLE_COOPMAT`, и вендорное правило ggml пускает (у AMD с фирменным драйвером и AMDVLK — только RDNA3, у Intel — Xe2 и встроенные Xe1) |
+| `coopmat2` | `VK_NV_cooperative_matrix2` со всеми нужными функциями, не выключено `GGML_VK_DISABLE_COOPMAT2`; размеры матриц ggml проверяет ещё раз при создании устройства |
+| `integerDotProduct` | `VK_KHR_shader_integer_dot_product` с ускоренным 4x8 packed signed, не выключено `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT` |
+| `fp16` | `VK_KHR_16bit_storage` + `VK_KHR_shader_float16_int8` + `shaderFloat16`, не выключено `GGML_VK_DISABLE_F16` |
+
+Флаги учитывают переменные `GGML_VK_DISABLE_*` так же, как ggml, поэтому на эмуляции
+пути AMD (`GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1
+GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`) `coopmat`, `coopmat2` и `integerDotProduct` —
+`false`; `vendorId`, `driverId` и `architecture` остаются настоящими.
+
+Фирменный драйвер AMD на `amd-gcn`, `amd-rdna1` и `amd-rdna2` (`vendorId` 4098,
+`driverId` 1) — ровно условие `old_amd_windows` в ggml-vulkan, при котором flash attention
+идёт отдельным путём шейдеров.
+
+При первом перечислении ggml пишет отладочную строку о возможностях каждого устройства;
+помощник сверяет с ней свои значения. В stderr на каждое устройство строка
+`podskazych-vk: устройство N: … сверка с ggml: совпало` (или `расхождение, взято у ggml: …`
+— тогда в hello значения ggml).
 
 ### 2. load
 
@@ -205,7 +249,8 @@ cmake --build build
 - `/DELAYLOAD:vulkan-1.dll` — без драйвера Vulkan exe всё равно запускается и отвечает
   hello с `vulkanLoader:false`; сама библиотека грузится только из System32.
 
-Проверка на раннере без видеокарты — `ci_smoke.py`: hello, мусор во входе, вычитывание
+Проверка на раннере без видеокарты — `ci_smoke.py`: hello (и подробности устройства на
+тестовом драйвере Vulkan из SDK, если он есть), мусор во входе, вычитывание
 звука при отказе, кириллические пути, quit, конец stdin, смерть родителя (код 5). Таблица
 импорта exe проверяется отдельно (`dumpbin /dependents`): на раннере VC++ redist
 установлен, и сам запуск этого не доказывает.

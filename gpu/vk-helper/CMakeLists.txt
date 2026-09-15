@@ -62,6 +62,12 @@ add_subdirectory("${WHISPER_CPP_DIR}" whisper.cpp EXCLUDE_FROM_ALL)
 
 add_executable(podskazych-vk main.cpp)
 target_link_libraries(podskazych-vk PRIVATE whisper)
+# main.cpp сам спрашивает драйвер о вендоре, драйвере и возможностях устройства (C API
+# Vulkan): ggml-vulkan эти сведения наружу не отдаёт. Цель Vulkan::Vulkan, найденная внутри
+# папки ggml, сюда не видна, поэтому ищем пакет ещё раз (путь уже в кэше). Импорты из
+# vulkan-1.dll остаются отложенными — /DELAYLOAD ниже действует на весь exe.
+find_package(Vulkan REQUIRED)
+target_link_libraries(podskazych-vk PRIVATE Vulkan::Vulkan)
 target_compile_features(podskazych-vk PRIVATE cxx_std_17)
 target_compile_definitions(podskazych-vk PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 # В main.cpp кириллица в строках: без /utf-8 MSVC прочитал бы исходник в ANSI-кодировке

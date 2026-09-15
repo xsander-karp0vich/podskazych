@@ -24,18 +24,20 @@ MAX_SAMPLES = 30 * 16000 * 2
 
 
 class Helper:
-    def __init__(self, exe, args=None):
+    def __init__(self, exe, args=None, env=None):
         self.proc = subprocess.Popen(
             [exe] + (args if args is not None else ["--parent-pid", str(os.getpid())]),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
         self.lines = queue.Queue()
         self.stderr = bytearray()
         threading.Thread(target=self._read_stdout, daemon=True).start()
         # stderr обязательно вычитывать: заполненная труба остановит помощника на записи лога
-        threading.Thread(target=self._read_stderr, daemon=True).start()
+        self.err_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self.err_thread.start()
 
     def _read_stdout(self):
         for raw in self.proc.stdout:
@@ -68,6 +70,47 @@ def check(cond, what):
     if not cond:
         raise AssertionError(what)
     print("  ok:", what)
+
+
+DETAIL_INTS = ("vendorId", "deviceId", "driverId", "driverVersionRaw")
+DETAIL_STRS = ("driverName", "driverInfo", "driverVersion", "apiVersion", "architecture")
+DETAIL_BOOLS = ("uma", "coopmat", "coopmat2", "integerDotProduct", "fp16")
+ARCHITECTURES = {"amd-gcn", "amd-rdna1", "amd-rdna2", "amd-rdna3", "intel-xe1", "intel-xe2",
+                 "nvidia-pre-turing", "nvidia-turing", "other"}
+
+
+def check_device(dev):
+    """Схема устройства в hello: подробности — все поля или ни одного. Возвращает, есть ли они."""
+    tag = f"устройство {dev.get('index')}"
+    check(type(dev.get("index")) is int and isinstance(dev.get("name"), str), f"{tag}: index и name")
+    check(dev.get("type") in ("discrete", "integrated", "other"), f"{tag}: type")
+    keys = DETAIL_INTS + DETAIL_STRS + DETAIL_BOOLS
+    present = [k for k in keys if k in dev]
+    check(not present or len(present) == len(keys), f"{tag}: подробности все или ни одной ({present})")
+    if not present:
+        return False
+    # bool в Python — подкласс int, поэтому сравнение типов строгое
+    check(all(type(dev[k]) is int and 0 <= dev[k] <= 0xFFFFFFFF for k in DETAIL_INTS), f"{tag}: целые поля")
+    check(all(type(dev[k]) is str for k in DETAIL_STRS), f"{tag}: строковые поля")
+    check(all(type(dev[k]) is bool for k in DETAIL_BOOLS), f"{tag}: логические поля")
+    check(dev["architecture"] in ARCHITECTURES, f"{tag}: architecture из известного списка")
+    check(dev["apiVersion"].count(".") == 2 and all(p.isdigit() for p in dev["apiVersion"].split(".")), f"{tag}: apiVersion x.y.z")
+    if dev["type"] in ("discrete", "integrated"):
+        check(dev["uma"] == (dev["type"] == "integrated"), f"{tag}: uma согласовано с type")
+    return True
+
+
+def find_mock_icd():
+    """Тестовый драйвер Vulkan (Mock ICD) из LunarG SDK: устройство без видеокарты. Нужен,
+    чтобы на раннере прошёл настоящий путь запроса подробностей и сопоставления с ggml."""
+    sdk = os.environ.get("VULKAN_SDK")
+    if not sdk:
+        return None
+    for root, _dirs, files in os.walk(sdk):
+        for name in files:
+            if name.lower() == "vkicd_mock_icd.json":
+                return os.path.join(root, name)
+    return None
 
 
 def expect_error(h, code=None, id_=None, timeout=60):
@@ -105,6 +148,48 @@ class ProcHandle:
         self.k32.CloseHandle(ctypes.c_void_p(self.h))
 
 
+def check_mock_icd(exe):
+    icd = find_mock_icd()
+    if not icd:
+        print("  Mock ICD в SDK не найден, проверка подробностей устройства на нём пропущена")
+        return
+    print("  Mock ICD:", icd)
+    env = dict(os.environ)
+    # VK_DRIVER_FILES — загрузчики 1.3.207+, VK_ICD_FILENAMES — старые; оба заменяют
+    # список драйверов, а не дополняют его.
+    env["VK_DRIVER_FILES"] = icd
+    env["VK_ICD_FILENAMES"] = icd
+    hm = Helper(exe, env=env)
+    hello = hm.recv(timeout=180)
+    print("  hello (Mock ICD):", json.dumps(hello, ensure_ascii=False))
+    check(hello["type"] == "hello" and isinstance(hello["devices"], list), "Mock ICD: hello пришёл")
+    detailed = [check_device(d) for d in hello["devices"]]
+    # Выключатели ggml должны отражаться во флагах: процесс с ними обязан ответить так же
+    # (сведения из того же драйвера), но без coopmat и integer dot product.
+    env_off = dict(env, GGML_VK_DISABLE_COOPMAT="1", GGML_VK_DISABLE_COOPMAT2="1",
+                   GGML_VK_DISABLE_INTEGER_DOT_PRODUCT="1", GGML_VK_DISABLE_F16="1")
+    ho = Helper(exe, env=env_off)
+    hello_off = ho.recv(timeout=180)
+    print("  hello (Mock ICD, GGML_VK_DISABLE_*):", json.dumps(hello_off, ensure_ascii=False))
+    for d in hello_off["devices"]:
+        if check_device(d):
+            check(not (d["coopmat"] or d["coopmat2"] or d["integerDotProduct"] or d["fp16"]),
+                  f"устройство {d['index']}: GGML_VK_DISABLE_* выключают флаги")
+    errs = []
+    for h in (hm, ho):
+        h.send({"type": "quit"})
+        code = h.proc.wait(timeout=60)
+        h.err_thread.join(timeout=10)
+        err = h.stderr.decode("utf-8", "replace")
+        errs.append(err)
+        print("  stderr (Mock ICD):", err[-1500:])
+        check(code == 0, f"Mock ICD: quit -> код 0 (получен {code})")
+        check("расхождение" not in err, "Mock ICD: сведения совпали со строкой ggml")
+    if hello["devices"]:
+        check(all(detailed), "Mock ICD: у устройств есть подробности")
+        check("сверка с ggml: совпало" in errs[0], "Mock ICD: сведения подтверждены строкой ggml")
+
+
 def main():
     # консоль раннера в cp1252: без этого первый же русский print падает
     sys.stdout.reconfigure(encoding="utf-8")
@@ -124,9 +209,13 @@ def main():
     check(hello["version"] == "1.9.4", "whisper_version() == 1.9.4")
     check(isinstance(hello["devices"], list), "devices — список")
     check(hello["cpuOk"] is True, "процессор раннера поддерживает AVX2")
+    for dev in hello["devices"]:
+        check_device(dev)
     no_gpu = len(hello["devices"]) == 0
     if not no_gpu:
         print("  внимание: на раннере нашлись устройства Vulkan, проверка no-device пропускается")
+
+    check_mock_icd(exe)
 
     def in_sync(tag):
         # Следующий ответ обязан быть ошибкой именно на этот запрос: лишних ответов нет.

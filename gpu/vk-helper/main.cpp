@@ -33,8 +33,13 @@
 #include <cstring>
 #include <exception>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
+
+// Только C API ядра Vulkan (без vulkan.hpp): у ggml-vulkan свой диспетчер vulkan.hpp,
+// и второй экземпляр его настроек в этом файле дал бы нарушение ODR.
+#include <vulkan/vulkan.h>
 
 #include "ggml-backend.h"
 #include "whisper.h"
@@ -819,12 +824,42 @@ bool start_parent_watch(DWORD pid) {
 std::atomic<bool> g_watch_load_log{false};
 std::atomic<bool> g_gpu_init_failed{false};
 
+// Во время первого перечисления устройств ggml-vulkan пишет отладочную строку на каждое
+// устройство: «ggml_vulkan: N = <имя> (<драйвер>) | uma: … | fp16: … | int dot: … |
+// matrix cores: …». Это ровно то, что ggml решил использовать, поэтому по ней сверяем
+// собственные сведения из Vulkan (attach_vulkan_details). Ключ — индекс устройства
+// внутри бэкенда Vulkan.
+std::atomic<bool> g_capture_vk_info{false};
+std::mutex g_vk_info_mutex;
+std::map<int, std::string> g_vk_info_lines;
+
+void capture_vk_info_line(const char * text) {
+    static const char kPrefix[] = "ggml_vulkan: ";
+    if (strncmp(text, kPrefix, sizeof(kPrefix) - 1) != 0) return;
+    const char * p = text + sizeof(kPrefix) - 1;
+    if (*p < '0' || *p > '9') return;
+    char * end = nullptr;
+    const long idx = strtol(p, &end, 10);
+    if (!end || strncmp(end, " = ", 3) != 0 || idx < 0 || idx > 1024) return;
+    std::string rest(end + 3);
+    while (!rest.empty() && (rest.back() == '\n' || rest.back() == '\r')) rest.pop_back();
+    std::lock_guard<std::mutex> lock(g_vk_info_mutex);
+    g_vk_info_lines[(int) idx] = rest;
+}
+
 void log_callback(enum ggml_log_level level, const char * text, void * /*user*/) {
     if (!text) return;
     if (g_watch_load_log.load() &&
         (strstr(text, "whisper_backend_init_gpu: no GPU found") ||
          strstr(text, "whisper_backend_init_gpu: failed to initialize"))) {
         g_gpu_init_failed.store(true);
+    }
+    if (g_capture_vk_info.load()) {
+        try {
+            capture_vk_info_line(text);
+        } catch (...) {
+            // сверка — необязательная часть, без неё сведения просто не подтверждены
+        }
     }
     if (level == GGML_LOG_LEVEL_DEBUG) return;
     fputs(text, stderr);
@@ -834,12 +869,43 @@ void log_callback(enum ggml_log_level level, const char * text, void * /*user*/)
 // Устройства
 // ---------------------------------------------------------------------------
 
+// Сведения о физическом устройстве из собственного запроса к Vulkan (vk_query_devices).
+struct VkDetails {
+    std::string name;
+    std::string driver_name;
+    std::string driver_info;
+    // "dddd:bb:dd.f" — в том же виде, что ggml_backend_vk_get_device_pci_id; пусто без
+    // VK_EXT_pci_bus_info.
+    std::string pci;
+    uint32_t type = VK_PHYSICAL_DEVICE_TYPE_OTHER;
+    uint32_t vendor_id = 0;
+    uint32_t device_id = 0;
+    uint32_t driver_id = 0;
+    uint32_t driver_version = 0;
+    uint32_t api_version = 0;
+    uint8_t uuid[VK_UUID_SIZE] = {};
+    uint8_t luid[VK_LUID_SIZE] = {};
+    bool luid_valid = false;
+    bool has_driver_props = false;
+    bool storage16 = false;  // условие ggml_vk_device_is_supported
+    bool uma = false;
+    bool coopmat = false;
+    bool coopmat2 = false;
+    bool integer_dot_product = false;
+    bool fp16 = false;
+    const char * architecture = "other";
+};
+
 struct DeviceInfo {
     int index = 0;  // тот же счёт, что gpu_device в whisper_context_params
+    int vk_index = -1;  // номер внутри бэкенда Vulkan (порядок vk_instance.device_indices)
     std::string name;
     std::string type;  // discrete | integrated | other
+    std::string pci;   // props.device_id ggml, может быть пустым
     int64_t vram_mb = 0;
     int64_t free_mb = 0;
+    bool has_details = false;
+    VkDetails vk;
 };
 
 bool g_cpu_ok = false;
@@ -851,6 +917,7 @@ std::vector<DeviceInfo> list_devices() {
     // whisper_backend_init_gpu считает gpu_device среди устройств типа GPU и IGPU в порядке
     // реестра ggml, поэтому индекс считаем точно так же, иначе загрузится не та карта.
     int counter = 0;
+    int vk_counter = 0;
     const size_t n = ggml_backend_dev_count();
     for (size_t i = 0; i < n; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -866,6 +933,9 @@ std::vector<DeviceInfo> list_devices() {
 
         DeviceInfo d;
         d.index = index;
+        // У бэкенда Vulkan устройства типа GPU и IGPU идут подряд в порядке device_indices.
+        d.vk_index = vk_counter++;
+        d.pci = props.device_id ? props.device_id : "";
         d.name = props.description ? props.description : (props.name ? props.name : "");
         d.type = t == GGML_BACKEND_DEVICE_TYPE_GPU ? "discrete" : "integrated";
         // Vulkan поверх Direct3D 12 (Mesa Dozen из «пакета совместимости OpenCL/OpenGL/Vulkan»)
@@ -881,15 +951,543 @@ std::vector<DeviceInfo> list_devices() {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Подробности устройств: прямые вызовы Vulkan
+// ---------------------------------------------------------------------------
+
+// Имени устройства сайдкару мало. Включать ли flash attention, зависит от вендора,
+// драйвера и поколения карты: у фирменного драйвера AMD на GCN/RDNA1/RDNA2 свой путь
+// шейдеров FA (флаг old_amd_windows в ggml-vulkan) с известными ошибками, а по имени
+// «AMD Radeon(TM) Graphics» не отличить 680M от 780M. ggml-vulkan эти сведения наружу не
+// отдаёт, поэтому спрашиваем драйвер сами, отдельным экземпляром Vulkan, и повторяем те же
+// проверки, что делает ggml (whisper.cpp v1.9.4, ggml-vulkan.cpp: get_device_architecture,
+// ggml_vk_print_gpu_info, ggml_vk_khr_cooperative_matrix_support): сайдкару нужно то, что
+// ggml реально будет использовать, а не просто список расширений драйвера.
+
+constexpr uint32_t kVendorAmd = 0x1002;
+constexpr uint32_t kVendorIntel = 0x8086;
+constexpr uint32_t kVendorNvidia = 0x10DE;
+constexpr uint32_t kVendorQualcomm = 0x5143;
+
+bool env_set(const char * name) {
+    return getenv(name) != nullptr;
+}
+
+uint32_t api_major_minor(uint32_t v) {
+    return VK_MAKE_API_VERSION(0, VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v), 0);
+}
+
+// Звено цепочки pNext. Структуры заранее обнулены, sType выставлен.
+class PNextChain {
+public:
+    explicit PNextChain(void * head) : last_((VkBaseOutStructure *) head) {}
+    void add(void * s) {
+        auto * b = (VkBaseOutStructure *) s;
+        b->pNext = nullptr;
+        last_->pNext = b;
+        last_ = b;
+    }
+
+private:
+    VkBaseOutStructure * last_;
+};
+
+std::string fixed_str(const char * s, size_t cap) {
+    return std::string(s, strnlen(s, cap));
+}
+
+void query_one_device(VkPhysicalDevice pd, VkDetails & d) {
+    VkPhysicalDeviceProperties p{};
+    vkGetPhysicalDeviceProperties(pd, &p);
+    d.name = fixed_str(p.deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE);
+    d.type = (uint32_t) p.deviceType;
+    d.vendor_id = p.vendorID;
+    d.device_id = p.deviceID;
+    d.driver_version = p.driverVersion;
+    d.api_version = p.apiVersion;
+    d.uma = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+
+    std::vector<VkExtensionProperties> exts;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        uint32_t count = 0;
+        if (vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, nullptr) != VK_SUCCESS) break;
+        exts.assign(count, VkExtensionProperties{});
+        const VkResult r = vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, exts.data());
+        if (r == VK_INCOMPLETE) continue;  // список вырос между вызовами
+        exts.resize(r == VK_SUCCESS ? count : 0);
+        break;
+    }
+    auto has = [&exts](const char * name) {
+        for (const auto & e : exts) {
+            if (strncmp(e.extensionName, name, VK_MAX_EXTENSION_NAME_SIZE) == 0) return true;
+        }
+        return false;
+    };
+
+    const uint32_t api = api_major_minor(p.apiVersion);
+    const bool api11 = api >= VK_API_VERSION_1_1;
+    const bool api12 = api >= VK_API_VERSION_1_2;
+    const bool ext_driver = api12 || has("VK_KHR_driver_properties");
+    const bool ext_pci = has("VK_EXT_pci_bus_info");
+    const bool ext_int_dot = has("VK_KHR_shader_integer_dot_product");
+    const bool ext_subgroup_size = has("VK_EXT_subgroup_size_control");
+    const bool ext_amd_core = has("VK_AMD_shader_core_properties");
+    const bool ext_sm_builtins = has("VK_NV_shader_sm_builtins");
+    const bool ext_coopmat = has("VK_KHR_cooperative_matrix");
+    const bool ext_coopmat2 = has("VK_NV_cooperative_matrix2");
+    const bool ext_fp16_storage = has("VK_KHR_16bit_storage");
+    const bool ext_fp16_compute = has("VK_KHR_shader_float16_int8");
+
+    // Выключатели ggml (ggml_vk_print_gpu_info): с ними устройство для ggml этого не умеет.
+    const bool use_coopmat = ext_coopmat && !env_set("GGML_VK_DISABLE_COOPMAT");
+    const bool use_coopmat2 = ext_coopmat2 && !env_set("GGML_VK_DISABLE_COOPMAT2");
+    const bool use_int_dot = ext_int_dot && !env_set("GGML_VK_DISABLE_INTEGER_DOT_PRODUCT");
+
+    // --- свойства ---
+    // В цепочку идут только структуры, которые устройство поддерживает по версии или
+    // расширению: незнакомый sType драйвер вправе не заполнить.
+    VkPhysicalDeviceProperties2 p2{};
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    VkPhysicalDeviceDriverProperties driver{};
+    driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+    VkPhysicalDeviceIDProperties id{};
+    id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{};
+    pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    VkPhysicalDeviceShaderIntegerDotProductProperties int_dot{};
+    int_dot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+    VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size{};
+    subgroup_size.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+    VkPhysicalDeviceShaderCorePropertiesAMD amd_core{};
+    amd_core.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD;
+    VkPhysicalDeviceShaderSMBuiltinsPropertiesNV sm_builtins{};
+    sm_builtins.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV;
+
+    PNextChain props_chain(&p2);
+    if (ext_driver) props_chain.add(&driver);
+    if (api11) props_chain.add(&id);
+    if (ext_pci) props_chain.add(&pci);
+    if (ext_int_dot) props_chain.add(&int_dot);
+    if (ext_subgroup_size) props_chain.add(&subgroup_size);
+    if (ext_amd_core) props_chain.add(&amd_core);
+    if (ext_sm_builtins) props_chain.add(&sm_builtins);
+    vkGetPhysicalDeviceProperties2(pd, &p2);
+
+    if (ext_driver) {
+        d.has_driver_props = true;
+        d.driver_id = (uint32_t) driver.driverID;
+        d.driver_name = fixed_str(driver.driverName, VK_MAX_DRIVER_NAME_SIZE);
+        d.driver_info = fixed_str(driver.driverInfo, VK_MAX_DRIVER_INFO_SIZE);
+    }
+    if (api11) {
+        memcpy(d.uuid, id.deviceUUID, VK_UUID_SIZE);
+        memcpy(d.luid, id.deviceLUID, VK_LUID_SIZE);
+        d.luid_valid = id.deviceLUIDValid == VK_TRUE;
+    }
+    if (ext_pci) {
+        char buf[16] = {};
+        snprintf(buf, sizeof(buf), "%04x:%02x:%02x.%x", pci.pciDomain, pci.pciBus, pci.pciDevice, (uint8_t) pci.pciFunction);
+        d.pci = buf;
+    }
+
+    // --- поколение карты: get_device_architecture ---
+    if (p.vendorID == kVendorAmd) {
+        if (ext_amd_core && ext_int_dot && ext_subgroup_size) {
+            if (subgroup_size.maxSubgroupSize == 64 && subgroup_size.minSubgroupSize == 64) {
+                d.architecture = "amd-gcn";
+            } else if (subgroup_size.maxSubgroupSize == 64 && subgroup_size.minSubgroupSize == 32) {
+                if (amd_core.wavefrontsPerSimd == 20) {
+                    d.architecture = "amd-rdna1";
+                } else if (int_dot.integerDotProduct4x8BitPackedMixedSignednessAccelerated) {
+                    d.architecture = "amd-rdna3";
+                } else {
+                    d.architecture = "amd-rdna2";
+                }
+            }
+        }
+    } else if (p.vendorID == kVendorIntel) {
+        if (ext_subgroup_size && ext_int_dot) {
+            if (subgroup_size.minSubgroupSize == 16) {
+                d.architecture = "intel-xe2";
+            } else if (subgroup_size.minSubgroupSize == 8 && int_dot.integerDotProduct4x8BitPackedSignedAccelerated) {
+                d.architecture = "intel-xe1";
+            }
+        }
+    } else if (p.vendorID == kVendorNvidia) {
+        // Как в ggml: «до Turing» определяется по отсутствию coopmat у драйвера.
+        if (!ext_coopmat) {
+            d.architecture = "nvidia-pre-turing";
+        } else if (ext_sm_builtins && sm_builtins.shaderWarpsPerSM == 32) {
+            d.architecture = "nvidia-turing";
+        }
+    }
+
+    // --- возможности: ggml_vk_device_is_supported и ggml_vk_print_gpu_info ---
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    VkPhysicalDeviceVulkan11Features vk11{};
+    vk11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    VkPhysicalDeviceVulkan12Features vk12{};
+    vk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopmat_f{};
+    coopmat_f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceShaderIntegerDotProductFeatures int_dot_f{};
+    int_dot_f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+    VkPhysicalDeviceCooperativeMatrix2FeaturesNV coopmat2_f{};
+    coopmat2_f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV;
+
+    PNextChain features_chain(&f2);
+    // Vulkan11/12Features существуют с Vulkan 1.2; ggml сам требует 1.2, и устройство
+    // старше для него всё равно непригодно.
+    if (api12) {
+        features_chain.add(&vk11);
+        features_chain.add(&vk12);
+    }
+    if (use_coopmat) features_chain.add(&coopmat_f);
+    if (use_int_dot) features_chain.add(&int_dot_f);
+    if (use_coopmat2) features_chain.add(&coopmat2_f);
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+
+    d.storage16 = api12 && vk11.storageBuffer16BitAccess == VK_TRUE;
+    d.fp16 = !env_set("GGML_VK_DISABLE_F16") && ext_fp16_storage && ext_fp16_compute && api12 && vk12.shaderFloat16 == VK_TRUE;
+    d.integer_dot_product = use_int_dot && int_dot.integerDotProduct4x8BitPackedSignedAccelerated && int_dot_f.shaderIntegerDotProduct;
+
+    // ggml_vk_khr_cooperative_matrix_support: драйверы AMD объявляют coopmat на всех
+    // картах, а Intel до Xe2 с ним медленнее, поэтому ggml включает его не везде.
+    bool coopmat_allowed = true;
+    if (p.vendorID == kVendorIntel) {
+        const std::string arch = d.architecture;
+        coopmat_allowed = arch == "intel-xe2" ||
+                          (arch == "intel-xe1" && p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+                           d.driver_id == (uint32_t) VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS);
+    } else if (p.vendorID == kVendorAmd &&
+               (d.driver_id == (uint32_t) VK_DRIVER_ID_AMD_PROPRIETARY || d.driver_id == (uint32_t) VK_DRIVER_ID_AMD_OPEN_SOURCE)) {
+        coopmat_allowed = strcmp(d.architecture, "amd-rdna3") == 0;
+    }
+    d.coopmat = use_coopmat && coopmat_f.cooperativeMatrix && coopmat_allowed;
+    d.coopmat2 = use_coopmat2 &&
+                 coopmat2_f.cooperativeMatrixWorkgroupScope && coopmat2_f.cooperativeMatrixFlexibleDimensions &&
+                 coopmat2_f.cooperativeMatrixReductions && coopmat2_f.cooperativeMatrixConversions &&
+                 coopmat2_f.cooperativeMatrixPerElementOperations && coopmat2_f.cooperativeMatrixTensorAddressing &&
+                 coopmat2_f.cooperativeMatrixBlockLoads;
+}
+
+// Все физические устройства в порядке vkEnumeratePhysicalDevices — том же, что видит ggml
+// в этом процессе (те же загрузчик, драйверы и переменные окружения).
+bool vk_query_devices(std::vector<VkDetails> * result, std::string * err) {
+    try {
+        uint32_t loader_api = VK_API_VERSION_1_0;
+        if (vkEnumerateInstanceVersion(&loader_api) != VK_SUCCESS) loader_api = VK_API_VERSION_1_0;
+        if (api_major_minor(loader_api) < VK_API_VERSION_1_2) {
+            *err = "загрузчик Vulkan старше 1.2";
+            return false;
+        }
+        VkApplicationInfo app{};
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        app.pApplicationName = "podskazych-vk";
+        app.apiVersion = loader_api;  // как в ggml_vk_instance_init
+        VkInstanceCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        ci.pApplicationInfo = &app;
+        VkInstance instance = VK_NULL_HANDLE;
+        const VkResult r = vkCreateInstance(&ci, nullptr, &instance);
+        if (r != VK_SUCCESS) {
+            *err = "vkCreateInstance вернул " + std::to_string((int) r);
+            return false;
+        }
+        struct InstanceGuard {
+            VkInstance h;
+            ~InstanceGuard() { vkDestroyInstance(h, nullptr); }
+        } guard{instance};
+
+        std::vector<VkPhysicalDevice> pds;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            uint32_t count = 0;
+            if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS) {
+                *err = "vkEnumeratePhysicalDevices не удался";
+                return false;
+            }
+            pds.assign(count, VK_NULL_HANDLE);
+            const VkResult er = vkEnumeratePhysicalDevices(instance, &count, pds.data());
+            if (er == VK_INCOMPLETE) continue;
+            if (er != VK_SUCCESS) {
+                *err = "vkEnumeratePhysicalDevices вернул " + std::to_string((int) er);
+                return false;
+            }
+            pds.resize(count);
+            break;
+        }
+
+        std::vector<VkDetails> out(pds.size());
+        for (size_t i = 0; i < pds.size(); ++i) query_one_device(pds[i], out[i]);
+        result->swap(out);
+        return true;
+    } catch (const std::exception & e) {
+        *err = e.what();
+        return false;
+    }
+}
+
+// Сбой внутри драйвера или слоя (нарушение доступа) не должен ронять помощника до hello:
+// сведения необязательны, без них сайдкар решает по имени устройства. Функция без
+// C++-объектов: __try нельзя смешивать с раскруткой деструкторов, поэтому при таком сбое
+// объекты внутри vk_query_devices просто утекают, а result не трогается.
+bool vk_query_devices_guarded(std::vector<VkDetails> * result, std::string * err, DWORD * seh_code) {
+    __try {
+        return vk_query_devices(result, err);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *seh_code = GetExceptionCode();
+        return false;
+    }
+}
+
+// Приоритет драйвера при двух физических устройствах одной карты: меньше — лучше.
+int ggml_driver_priority(uint32_t vendor_of_first, uint32_t driver_id) {
+    switch (vendor_of_first) {
+        case kVendorAmd:
+            if (driver_id == (uint32_t) VK_DRIVER_ID_MESA_RADV) return 1;
+            if (driver_id == (uint32_t) VK_DRIVER_ID_AMD_OPEN_SOURCE) return 2;
+            if (driver_id == (uint32_t) VK_DRIVER_ID_AMD_PROPRIETARY) return 3;
+            break;
+        case kVendorIntel:
+            if (driver_id == (uint32_t) VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) return 1;
+            if (driver_id == (uint32_t) VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) return 2;
+            break;
+        case kVendorNvidia:
+            if (driver_id == (uint32_t) VK_DRIVER_ID_NVIDIA_PROPRIETARY) return 1;
+            if (driver_id == (uint32_t) VK_DRIVER_ID_MESA_NVK) return 2;
+            break;
+        case kVendorQualcomm:
+            if (driver_id == (uint32_t) VK_DRIVER_ID_QUALCOMM_PROPRIETARY) return 1;
+            if (driver_id == (uint32_t) VK_DRIVER_ID_MESA_TURNIP) return 2;
+            break;
+    }
+    if (driver_id == (uint32_t) VK_DRIVER_ID_MESA_DOZEN) return 100;
+    return INT32_MAX;
+}
+
+// Повтор выбора устройств из ggml_vk_instance_init: номер N бэкенда Vulkan — это
+// физическое устройство order[N]. ok=false, если ggml на таком окружении сам откажется
+// (неверный индекс в GGML_VK_VISIBLE_DEVICES).
+std::vector<size_t> ggml_device_order(const std::vector<VkDetails> & devs, bool & ok) {
+    ok = true;
+    std::vector<size_t> order;
+    if (const char * env = getenv("GGML_VK_VISIBLE_DEVICES")) {
+        const char * p = env;
+        for (;;) {
+            while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+            if (*p < '0' || *p > '9') {
+                if (*p != '\0') ok = false;  // ggml прочитал бы мусор иначе, не угадываем
+                break;
+            }
+            char * end = nullptr;
+            const unsigned long v = strtoul(p, &end, 10);
+            if (v >= devs.size()) {
+                ok = false;
+                break;
+            }
+            order.push_back((size_t) v);
+            p = end;
+        }
+        return order;
+    }
+    for (size_t i = 0; i < devs.size(); ++i) {
+        const VkDetails & nd = devs[i];
+        if (!(nd.type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || nd.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) || !nd.storage16) {
+            continue;
+        }
+        auto old = std::find_if(order.begin(), order.end(), [&](size_t k) {
+            const VkDetails & od = devs[k];
+            bool same = memcmp(od.uuid, nd.uuid, VK_UUID_SIZE) == 0;
+            same = same || (od.luid_valid && nd.luid_valid && memcmp(od.luid, nd.luid, VK_LUID_SIZE) == 0);
+            const bool both_molten = od.driver_id == (uint32_t) VK_DRIVER_ID_MOLTENVK && nd.driver_id == (uint32_t) VK_DRIVER_ID_MOLTENVK;
+            return same && !both_molten;
+        });
+        if (old == order.end()) {
+            order.push_back(i);
+            continue;
+        }
+        const size_t old_index = *old;
+        const int old_priority = ggml_driver_priority(devs[old_index].vendor_id, devs[old_index].driver_id);
+        const int new_priority = ggml_driver_priority(devs[old_index].vendor_id, nd.driver_id);
+        if (new_priority < old_priority) {
+            order.erase(std::remove(order.begin(), order.end(), old_index), order.end());
+            order.push_back(i);
+        }
+    }
+    if (order.empty()) {
+        for (size_t i = 0; i < devs.size(); ++i) {
+            if (devs[i].type != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                order.push_back(i);
+                break;
+            }
+        }
+    }
+    return order;
+}
+
+bool same_device(const VkDetails & v, const DeviceInfo & d) {
+    return v.name == d.name && (d.pci.empty() || v.pci.empty() || v.pci == d.pci);
+}
+
+// Сверка с отладочной строкой ggml для того же номера устройства. false — строка про
+// другое устройство (не совпали имя или драйвер): тогда сведения не отдаём вовсе.
+// Возможности, которые видны в строке, берём у ggml: он решает, что использовать.
+bool reconcile_with_ggml(const std::string & line, VkDetails & v, std::string & diff) {
+    const std::string head = v.name + " (" + v.driver_name + ") | ";
+    if (line.compare(0, head.size(), head) != 0) return false;
+    std::map<std::string, std::string> kv;
+    size_t pos = head.size();
+    while (pos <= line.size()) {
+        size_t next = line.find(" | ", pos);
+        const std::string item = line.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        const size_t colon = item.find(": ");
+        if (colon != std::string::npos) kv[item.substr(0, colon)] = item.substr(colon + 2);
+        if (next == std::string::npos) break;
+        pos = next + 3;
+    }
+    auto flag = [&](const char * key, bool & mine, bool theirs) {
+        if (mine != theirs) {
+            diff += std::string(diff.empty() ? "" : ", ") + key + " " + (mine ? "1" : "0") + "→" + (theirs ? "1" : "0");
+            mine = theirs;
+        }
+    };
+    if (kv.count("uma")) flag("uma", v.uma, kv["uma"] != "0");
+    if (kv.count("fp16")) flag("fp16", v.fp16, kv["fp16"] != "0");  // "1" или "dot2"
+    if (kv.count("int dot")) flag("int dot", v.integer_dot_product, kv["int dot"] != "0");
+    if (kv.count("matrix cores")) {
+        const std::string & cores = kv["matrix cores"];
+        const bool cm2 = cores.compare(0, 11, "NV_coopmat2") == 0;
+        flag("coopmat2", v.coopmat2, cm2);
+        // При coopmat2 ggml не показывает, есть ли KHR coopmat, — остаётся наше значение.
+        if (!cm2) flag("coopmat", v.coopmat, cores == "KHR_coopmat");
+    }
+    return true;
+}
+
+void attach_vulkan_details(std::vector<DeviceInfo> & devs) {
+    if (devs.empty() || !g_vulkan_loader) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<VkDetails> phys;
+    std::string err;
+    DWORD seh = 0;
+    if (!vk_query_devices_guarded(&phys, &err, &seh)) {
+        if (seh) {
+            fprintf(stderr, "podskazych-vk: сбой 0x%08lx при запросе сведений Vulkan, отдаём устройства без них\n", seh);
+        } else {
+            fprintf(stderr, "podskazych-vk: сведения Vulkan недоступны (%s)\n", err.c_str());
+        }
+        return;
+    }
+    const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+
+    bool order_ok = true;
+    const std::vector<size_t> order = ggml_device_order(phys, order_ok);
+    std::map<int, std::string> lines;
+    {
+        std::lock_guard<std::mutex> lock(g_vk_info_mutex);
+        lines = g_vk_info_lines;
+    }
+
+    for (auto & d : devs) {
+        int found = -1;
+        if (order_ok && d.vk_index >= 0 && (size_t) d.vk_index < order.size() && same_device(phys[order[(size_t) d.vk_index]], d)) {
+            found = (int) order[(size_t) d.vk_index];
+        }
+        if (found < 0) {
+            // Порядок не повторился (другая версия ggml или необычное окружение): годится
+            // только однозначное совпадение по имени и PCI.
+            for (size_t j = 0; j < phys.size(); ++j) {
+                if (phys[j].type == VK_PHYSICAL_DEVICE_TYPE_CPU || !same_device(phys[j], d)) continue;
+                if (found >= 0) {
+                    found = -2;
+                    break;
+                }
+                found = (int) j;
+            }
+        }
+        if (found < 0) {
+            fprintf(stderr, "podskazych-vk: устройство %d (%s) не сопоставлено с Vulkan, без подробностей\n", d.index, d.name.c_str());
+            continue;
+        }
+        VkDetails v = phys[(size_t) found];
+        if (!v.has_driver_props) {
+            fprintf(stderr, "podskazych-vk: устройство %d (%s) без VkPhysicalDeviceDriverProperties, без подробностей\n", d.index, d.name.c_str());
+            continue;
+        }
+        const char * checked = "нет строки ggml";
+        std::string diff;
+        auto it = lines.find(d.vk_index);
+        if (it != lines.end()) {
+            if (!reconcile_with_ggml(it->second, v, diff)) {
+                fprintf(stderr, "podskazych-vk: устройство %d: ggml описывает его как «%s», сведения Vulkan не отдаём\n", d.index, it->second.c_str());
+                continue;
+            }
+            checked = diff.empty() ? "совпало" : "расхождение, взято у ggml";
+        }
+        d.vk = v;
+        d.has_details = true;
+        fprintf(stderr,
+                "podskazych-vk: устройство %d: %s, vendor 0x%04x, device 0x%04x, драйвер %s %s, arch %s, coopmat %d, coopmat2 %d, int dot %d, fp16 %d; сверка с ggml: %s%s%s (%lld мс)\n",
+                d.index, v.name.c_str(), v.vendor_id, v.device_id, v.driver_name.c_str(), v.driver_info.c_str(), v.architecture,
+                (int) v.coopmat, (int) v.coopmat2, (int) v.integer_dot_product, (int) v.fp16, checked,
+                diff.empty() ? "" : ": ", diff.c_str(), (long long) ms);
+    }
+}
+
+// Версия драйвера по-человечески. Кодировка у вендоров своя: NVIDIA — 10.8.8.6 бит
+// (581.29), Intel на Windows — 18.14 (101.6130), остальные — как версия Vulkan.
+std::string driver_version_text(const VkDetails & v) {
+    const uint32_t x = v.driver_version;
+    char buf[64];
+    if (v.vendor_id == kVendorNvidia && v.driver_id == (uint32_t) VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+        const uint32_t a = (x >> 6) & 0xff;
+        const uint32_t b = x & 0x3f;
+        if (a || b) {
+            snprintf(buf, sizeof(buf), "%u.%02u.%u.%u", (x >> 22) & 0x3ff, (x >> 14) & 0xff, a, b);
+        } else {
+            snprintf(buf, sizeof(buf), "%u.%02u", (x >> 22) & 0x3ff, (x >> 14) & 0xff);
+        }
+    } else if (v.vendor_id == kVendorIntel && v.driver_id == (uint32_t) VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
+        snprintf(buf, sizeof(buf), "%u.%u", x >> 14, x & 0x3fff);
+    } else {
+        snprintf(buf, sizeof(buf), "%u.%u.%u", x >> 22, (x >> 12) & 0x3ff, x & 0xfff);
+    }
+    return buf;
+}
+
 std::string devices_json(const std::vector<DeviceInfo> & devs) {
     std::string s = "[";
     for (size_t i = 0; i < devs.size(); ++i) {
+        const DeviceInfo & d = devs[i];
         JsonWriter w;
-        w.num("index", devs[i].index)
-         .str("name", devs[i].name)
-         .str("type", devs[i].type)
-         .num("vramMB", devs[i].vram_mb)
-         .num("freeMB", devs[i].free_mb);
+        w.num("index", d.index)
+         .str("name", d.name)
+         .str("type", d.type)
+         .num("vramMB", d.vram_mb)
+         .num("freeMB", d.free_mb);
+        // Подробности — все поля сразу или ни одного (не удалось спросить драйвер или
+        // сопоставить устройство с ggml).
+        if (d.has_details) {
+            const VkDetails & v = d.vk;
+            char api[32];
+            snprintf(api, sizeof(api), "%u.%u.%u", VK_API_VERSION_MAJOR(v.api_version), VK_API_VERSION_MINOR(v.api_version),
+                     VK_API_VERSION_PATCH(v.api_version));
+            w.num("vendorId", v.vendor_id)
+             .num("deviceId", v.device_id)
+             .num("driverId", v.driver_id)
+             .str("driverName", v.driver_name)
+             .str("driverInfo", v.driver_info)
+             .str("driverVersion", driver_version_text(v))
+             .num("driverVersionRaw", v.driver_version)
+             .str("apiVersion", api)
+             .str("architecture", v.architecture)
+             .boolean("uma", v.uma)
+             .boolean("coopmat", v.coopmat)
+             .boolean("coopmat2", v.coopmat2)
+             .boolean("integerDotProduct", v.integer_dot_product)
+             .boolean("fp16", v.fp16);
+        }
         if (i) s.push_back(',');
         s += w.done();
     }
@@ -1342,12 +1940,25 @@ int run(int argc, wchar_t ** argv) {
 
     std::vector<DeviceInfo> devs;
     std::string enum_error;
+    // Первое обращение к реестру ggml поднимает экземпляр Vulkan, и именно тогда ggml пишет
+    // строки о возможностях устройств — ловим их для сверки.
+    g_capture_vk_info.store(true);
     try {
         devs = list_devices();
     } catch (const std::exception & e) {
         enum_error = e.what();
     } catch (...) {
         enum_error = "неизвестное исключение";
+    }
+    g_capture_vk_info.store(false);
+    try {
+        attach_vulkan_details(devs);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "podskazych-vk: сведения Vulkan не собраны: %s\n", e.what());
+        for (auto & d : devs) d.has_details = false;
+    } catch (...) {
+        fprintf(stderr, "podskazych-vk: сведения Vulkan не собраны\n");
+        for (auto & d : devs) d.has_details = false;
     }
 
     {
