@@ -128,24 +128,39 @@ def main():
     if not no_gpu:
         print("  внимание: на раннере нашлись устройства Vulkan, проверка no-device пропускается")
 
-    # --- мусор во входе ---
-    h.send(b"{bad json")
+    def in_sync(tag):
+        # Следующий ответ обязан быть ошибкой именно на этот запрос: лишних ответов нет.
+        h.send({"type": "sentinel-" + tag})
+        msg = expect_error(h, "bad-json")
+        check("sentinel-" + tag in msg.get("message", ""), f"поток в порядке после «{tag}»")
+
+    # --- корректный JSON с незнакомыми полями и неизвестный type: ошибка, работа дальше ---
+    h.send({"type": "nope"})
     expect_error(h, "bad-json")
-    h.send(b'{"type":"load","model":"a","model":"b"}')
-    expect_error(h, "bad-json")
-    h.send(b'{"type":"nope"}')
-    expect_error(h, "bad-json")
-    h.send(b"x" * (70 * 1024))
-    expect_error(h, "bad-json")
-    h.send(b'{"type":"transcribe","id":1,"samples":1.5}')
-    expect_error(h, "bad-json")
-    h.send(b'{"type":"transcribe","id":2,"samples":"1600"}')
-    expect_error(h, None, 2)
+    h.send(b'{"type":"nope2","x":-1.5e-3,"big":99999999999999999999,"o":{"a":[1,{"b":null}],"c":"d"},'
+           b'"arr":[1,"a",2.0,[]],"t":true,"id":3}')
+    msg = expect_error(h, "bad-json", 3)
+    check("nope2" in msg["message"], "незнакомые поля всех типов не мешают разбору")
+    h.send(b'{"type":1,"id":4}')
+    expect_error(h, "bad-json", 4)
+    in_sync("types")
+    # неизвестный type со звуком: байты пропущены по samples
+    h.send({"type": "future", "id": 5, "samples": 400}, b"\n{}\n" * 400)
+    expect_error(h, "bad-json", 5)
+    in_sync("future")
 
     # --- transcribe до load: звук вычитан, ответ с id, поток не сломан ---
     pcm = struct.pack("<1600f", *([0.0] * 1600))
     h.send({"type": "transcribe", "id": 7, "samples": 1600, "language": "ru"}, pcm)
     expect_error(h, None, 7)
+    # дробное незнакомое поле в заголовке и 0x0A в звуке: ровно один ответ
+    h.send(b'{"type":"transcribe","id":6,"samples":1000,"temperature":0.0,"opts":{"beam":[5]}}',
+           (b"\n" * 7 + b"{") * 500)
+    expect_error(h, None, 6)
+    in_sync("float-field")
+    h.send({"type": "transcribe", "id": 10, "samples": 0, "language": "ru"})
+    expect_error(h, None, 10)
+    in_sync("samples0")
     # в звуке байт '\n' и фигурные скобки — они не должны разобраться как заголовок
     tricky = (b"\n{}\n" * 400)
     h.send({"type": "transcribe", "id": 8, "samples": len(tricky) // 4}, tricky)
@@ -188,6 +203,33 @@ def main():
     h2.recv(timeout=180)
     h2.proc.stdin.close()
     check(h2.proc.wait(timeout=60) == 0, "EOF на stdin -> выход с кодом 0")
+
+    # --- граница сообщения неизвестна: одна ошибка и код 6, а не поток ответов на звук ---
+    deep = b'{"type":"x","a":' + b"[" * 40 + b"]" * 40 + b"}"
+    desync_cases = [
+        ("не JSON", b"{bad json", b"", "bad-json", None),
+        ("повтор ключа", b'{"type":"load","model":"a","model":"b"}', b"", "bad-json", None),
+        ("строка 70 КБ", b"x" * (70 * 1024), b"", "bad-json", None),
+        ("вложенность 40", deep, b"", "bad-json", None),
+        ("samples дробное", b'{"type":"transcribe","id":1,"samples":1.5}', b"\n" * 6, None, 1),
+        ("samples строкой", b'{"type":"transcribe","id":2,"samples":"1600"}', b"\n" * 64, None, 2),
+        ("samples нет", b'{"type":"transcribe","id":3}', b"\n{}" * 100, None, 3),
+        ("samples < 0", b'{"type":"transcribe","id":4,"samples":-4}', b"", None, 4),
+        # 2^62+1: samples*4 переполнил бы uint64 и пропустил бы 4 байта вместо 2^64
+        ("samples 2^62+1", b'{"type":"transcribe","id":15,"samples":4611686018427387905}', b"ABCD", None, 15),
+        ("samples у load дробное", b'{"type":"load","id":5,"samples":2.5}', b"", None, 5),
+    ]
+    for name, header, payload, code, id_ in desync_cases:
+        hd = Helper(exe)
+        hd.recv(timeout=180)
+        try:
+            hd.send(header, payload)
+        except OSError:
+            pass  # помощник мог выйти раньше, чем дописан хвост
+        expect_error(hd, code, id_)
+        rc = hd.proc.wait(timeout=60)
+        check(rc == 6, f"{name}: код выхода 6 (получен {rc})")
+        check(hd.lines.get(timeout=10) is None, f"{name}: больше ответов нет")
 
     # --- родитель убит -> помощник выходит сам ---
     # Пишущий конец stdin помощника держим здесь, а не в убиваемом родителе: иначе

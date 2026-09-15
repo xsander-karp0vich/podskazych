@@ -50,6 +50,12 @@ constexpr size_t kMaxHeaderBytes = 64 * 1024;
 // Одна фраза сайдкара не длиннее 30 с; двойной запас на случай склейки, но не больше,
 // чтобы ошибка в размере не заставила выделить гигабайты.
 constexpr int64_t kMaxSamples = 30 * 16000 * 2;
+// Предел поля samples, до которого лишний звук ещё вычитывается и пропускается (около
+// 4 ГБ). Больше — заведомо испорченный заголовок: пропускать нечего, samples×4 ещё и
+// переполнил бы счётчик. Такой поток считается рассинхронизированным (kExitDesync).
+constexpr int64_t kMaxFrameSamples = (int64_t) 1 << 30;
+// Вложенность объектов и массивов в неизвестных полях; глубже — ошибка разбора.
+constexpr int kMaxJsonDepth = 32;
 // Окно подсказки whisper: n_text_ctx/2 = 224, один слот занимает <|startofprev|>.
 // Если отдать больше, whisper.cpp молча отрежет НАЧАЛО, а там у нас самые важные
 // термины, поэтому лишнее отклоняем явно.
@@ -268,10 +274,21 @@ void send_error(const char * code, const std::string & message, bool has_id = fa
 // ---------------------------------------------------------------------------
 
 // Полноценная библиотека JSON ради пяти плоских сообщений не нужна, но разбор обязан
-// быть строгим: любая неверная строка даёт ответ-ошибку, а не падение или чтение
-// за границей буфера.
+// быть строгим: неверный JSON даёт ответ-ошибку, а не падение или чтение за границей
+// буфера. При этом любой КОРРЕКТНЫЙ JSON разбирается целиком: пакет GPU скачивается
+// отдельно от приложения, и новое поле сайдкара (дробное число, объект, массив строк)
+// не должно ломать старого помощника. Неподходящий тип отвергают только get_*.
 struct JsonValue {
-    enum class Kind { Null, Bool, Int, String, IntArray } kind = Kind::Null;
+    enum class Kind {
+        Null,
+        Bool,
+        Int,       // целое в пределах int64
+        Number,    // дробное, с экспонентой или вне int64 — значение не хранится
+        String,
+        IntArray,  // массив только из целых (в том числе пустой)
+        Array,     // любой другой массив — содержимое не хранится
+        Object,    // вложенный объект — содержимое не хранится
+    } kind = Kind::Null;
     bool b = false;
     int64_t i = 0;
     std::string s;
@@ -340,7 +357,7 @@ private:
         return false;
     }
 
-    bool parse_value(JsonValue & v, std::string & err) {
+    bool parse_value(JsonValue & v, std::string & err, int depth = 0) {
         if (p_ >= end_) return fail(err, "обрыв строки на месте значения");
         char c = *p_;
         if (c == '"') {
@@ -365,8 +382,10 @@ private:
             return true;
         }
         if (c == '-' || (c >= '0' && c <= '9')) {
-            v.kind = JsonValue::Kind::Int;
-            return parse_int(v.i, err);
+            return parse_number(v, err);
+        }
+        if (c == '[' || c == '{') {
+            if (depth >= kMaxJsonDepth) return fail(err, "слишком глубокая вложенность");
         }
         if (c == '[') {
             ++p_;
@@ -375,45 +394,86 @@ private:
             if (eat(']')) return true;
             for (;;) {
                 skip_ws();
-                if (p_ >= end_ || !(*p_ == '-' || (*p_ >= '0' && *p_ <= '9'))) {
-                    return fail(err, "в массиве допускаются только целые числа");
+                JsonValue item;
+                if (!parse_value(item, err, depth + 1)) return false;
+                if (v.kind == JsonValue::Kind::IntArray) {
+                    if (item.kind == JsonValue::Kind::Int) {
+                        // Массив на миллионы элементов в 64 КБ не поместится: длина строки
+                        // уже ограничена.
+                        v.arr.push_back(item.i);
+                    } else {
+                        v.kind = JsonValue::Kind::Array;
+                        v.arr.clear();
+                    }
                 }
-                int64_t x = 0;
-                if (!parse_int(x, err)) return false;
-                // Защита от массива на миллионы элементов внутри 64 КБ не нужна:
-                // размер строки уже ограничен, но и лишнего копить незачем.
-                v.arr.push_back(x);
                 skip_ws();
                 if (eat(',')) continue;
                 if (eat(']')) return true;
                 return fail(err, "ожидалось ',' или ']' в массиве");
             }
         }
-        if (c == '{') return fail(err, "вложенные объекты не поддерживаются");
+        if (c == '{') {
+            ++p_;
+            v.kind = JsonValue::Kind::Object;
+            skip_ws();
+            if (eat('}')) return true;
+            for (;;) {
+                skip_ws();
+                std::string key;
+                if (!parse_string(key, err)) return false;
+                skip_ws();
+                if (!eat(':')) return fail(err, "ожидалось ':' после ключа");
+                skip_ws();
+                JsonValue item;
+                if (!parse_value(item, err, depth + 1)) return false;
+                skip_ws();
+                if (eat(',')) continue;
+                if (eat('}')) return true;
+                return fail(err, "ожидалось ',' или '}'");
+            }
+        }
         return fail(err, "неизвестное значение");
     }
 
-    bool parse_int(int64_t & out, std::string & err) {
+    // Число по грамматике JSON: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+    // Целое в пределах int64 — Kind::Int, любое другое корректное — Kind::Number.
+    bool parse_number(JsonValue & v, std::string & err) {
         bool neg = eat('-');
         if (p_ >= end_ || *p_ < '0' || *p_ > '9') return fail(err, "ожидалась цифра");
         if (*p_ == '0' && p_ + 1 < end_ && p_[1] >= '0' && p_[1] <= '9') {
             return fail(err, "ведущие нули в числе");
         }
         uint64_t acc = 0;
+        bool fits = true;
         const uint64_t limit = neg ? (uint64_t) INT64_MAX + 1 : (uint64_t) INT64_MAX;
         while (p_ < end_ && *p_ >= '0' && *p_ <= '9') {
             uint64_t d = (uint64_t) (*p_ - '0');
-            if (acc > (limit - d) / 10) return fail(err, "число вне диапазона");
-            acc = acc * 10 + d;
+            if (fits && acc > (limit - d) / 10) fits = false;
+            if (fits) acc = acc * 10 + d;
             ++p_;
         }
-        if (p_ < end_ && (*p_ == '.' || *p_ == 'e' || *p_ == 'E')) {
-            return fail(err, "дробные числа не поддерживаются");
+        bool integer = true;
+        if (eat('.')) {
+            integer = false;
+            if (p_ >= end_ || *p_ < '0' || *p_ > '9') return fail(err, "ожидалась цифра после точки");
+            while (p_ < end_ && *p_ >= '0' && *p_ <= '9') ++p_;
         }
+        if (p_ < end_ && (*p_ == 'e' || *p_ == 'E')) {
+            integer = false;
+            ++p_;
+            if (p_ < end_ && (*p_ == '+' || *p_ == '-')) ++p_;
+            if (p_ >= end_ || *p_ < '0' || *p_ > '9') return fail(err, "ожидалась цифра в экспоненте");
+            while (p_ < end_ && *p_ >= '0' && *p_ <= '9') ++p_;
+        }
+        if (!integer || !fits) {
+            v.kind = JsonValue::Kind::Number;
+            return true;
+        }
+        v.kind = JsonValue::Kind::Int;
         if (neg) {
-            out = acc == (uint64_t) INT64_MAX + 1 ? INT64_MIN : -(int64_t) acc;
+            v.i = acc == (uint64_t) INT64_MAX + 1 ? INT64_MIN : -(int64_t) acc;
         } else {
-            out = (int64_t) acc;
+            v.i = (int64_t) acc;
         }
         return true;
     }
@@ -1002,17 +1062,11 @@ void handle_load(const JsonObject & msg) {
     proto_write_line(w.done());
 }
 
+// samples уже проверен кадрированием в run(): 0..kMaxFrameSamples, байты звука ещё в потоке.
 // Возвращает false, если поток ввода кончился (дальше работать нечем).
-bool handle_transcribe(const JsonObject & msg, Input & in) {
+bool handle_transcribe(const JsonObject & msg, Input & in, int64_t samples) {
     int64_t id = 0;
     const bool has_id = get_int(msg, "id", id) == Field::Ok;
-    int64_t samples = -1;
-    if (get_int(msg, "samples", samples) != Field::Ok || samples < 0) {
-        // Без числа отсчётов неизвестно, сколько байт звука идёт следом, и поток
-        // рассинхронизирован. Сообщаем, дальше строки будут разбираться как есть.
-        send_error(nullptr, "нужно целое неотрицательное поле samples; поток мог рассинхронизироваться", has_id, id);
-        return true;
-    }
     if (samples > kMaxSamples) {
         // Байты всё равно вычитываем: иначе звук разобрался бы как следующие заголовки.
         if (!in.skip((uint64_t) samples * 4)) return false;
@@ -1021,7 +1075,14 @@ bool handle_transcribe(const JsonObject & msg, Input & in) {
         return true;
     }
 
-    std::vector<float> pcm((size_t) samples);
+    std::vector<float> pcm;
+    try {
+        pcm.resize((size_t) samples);
+    } catch (const std::bad_alloc &) {
+        if (!in.skip((uint64_t) samples * 4)) return false;
+        send_error(nullptr, "не хватило памяти под звук", has_id, id);
+        return true;
+    }
     if (samples > 0 && !in.read_exact((char *) pcm.data(), (size_t) samples * 4)) return false;
 
     std::string language = "ru";
@@ -1157,6 +1218,15 @@ bool handle_transcribe(const JsonObject & msg, Input & in) {
     return true;
 }
 
+// Границу следующего сообщения определить нельзя: байты звука с 0x0A разобрались бы как
+// десятки «строк» и съели бы настоящий запрос. Одна ошибка и выход с kExitDesync —
+// клиент перезапускает процесс.
+[[noreturn]] void desync(const char * code, const std::string & message, bool has_id, int64_t id) {
+    send_error(code, message + "; граница следующего сообщения неизвестна, помощник завершается", has_id, id);
+    drop_context();
+    hard_exit(kExitDesync);
+}
+
 int run(int argc, wchar_t ** argv) {
     // Никаких окон «программа выполнила недопустимую операцию» и abort-диалогов:
     // процесс без окна, упавший помощник должен просто завершиться.
@@ -1242,14 +1312,16 @@ int run(int argc, wchar_t ** argv) {
         proto_write_line(w.done());
     }
 
+    // Кадрирование потока: строка JSON, и если в объекте есть целое поле samples, за
+    // строкой идут samples×4 байт (правило общее для всех type, чтобы старый помощник
+    // пропускал звук и у сообщений, которых он не знает).
     Input in(in_handle);
     std::string line;
     for (;;) {
         const Input::Line r = in.read_line(line);
         if (r == Input::Line::Eof) break;
         if (r == Input::Line::TooLong) {
-            send_error("bad-json", "строка длиннее 64 КБ отброшена");
-            continue;
+            desync("bad-json", "строка длиннее 64 КБ", false, 0);
         }
         if (line.empty()) continue;
 
@@ -1257,24 +1329,49 @@ int run(int argc, wchar_t ** argv) {
         std::string err;
         JsonParser parser(line.data(), line.size());
         if (!parser.parse(msg, err)) {
-            send_error("bad-json", "неверный JSON: " + err);
-            continue;
+            desync("bad-json", "неверный JSON: " + err, false, 0);
         }
+
+        int64_t id = 0;
+        const bool has_id = get_int(msg, "id", id) == Field::Ok;
+        int64_t samples = -1;  // -1 — поля нет, звука за строкой нет
+        {
+            auto it = msg.find("samples");
+            if (it != msg.end() && it->second.kind != JsonValue::Kind::Null) {
+                if (it->second.kind != JsonValue::Kind::Int || it->second.i < 0) {
+                    desync(nullptr, "samples должно быть целым неотрицательным числом", has_id, id);
+                }
+                if (it->second.i > kMaxFrameSamples) {
+                    desync(nullptr, "samples = " + std::to_string(it->second.i) + " больше предела " +
+                           std::to_string(kMaxFrameSamples), has_id, id);
+                }
+                samples = it->second.i;
+            }
+        }
+
         std::string type;
-        if (get_str(msg, "type", type) != Field::Ok) {
-            send_error("bad-json", "нет строкового поля type");
+        const bool has_type = get_str(msg, "type", type) == Field::Ok;
+        if (has_type && type == "transcribe" && samples < 0) {
+            // Звук за заголовком transcribe почти наверняка есть, но сколько — неизвестно.
+            desync(nullptr, "в transcribe нужно целое неотрицательное поле samples", has_id, id);
+        }
+        if (!(has_type && type == "transcribe") && samples > 0) {
+            if (!in.skip((uint64_t) samples * 4)) break;
+        }
+        if (!has_type) {
+            send_error("bad-json", "нет строкового поля type", has_id, id);
             continue;
         }
 
         try {
             if (type == "transcribe") {
-                if (!handle_transcribe(msg, in)) break;
+                if (!handle_transcribe(msg, in, samples)) break;
             } else if (type == "load") {
                 handle_load(msg);
             } else if (type == "quit") {
                 break;
             } else {
-                send_error("bad-json", "неизвестный type: " + type);
+                send_error("bad-json", "неизвестный type: " + type, has_id, id);
             }
         } catch (const std::bad_alloc &) {
             send_error(nullptr, "не хватило памяти");
