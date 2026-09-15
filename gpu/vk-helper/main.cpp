@@ -18,6 +18,7 @@
 // Протокол описан в README.md рядом.
 
 #include <windows.h>
+#include <delayimp.h>
 #include <io.h>
 #include <fcntl.h>
 #include <intrin.h>
@@ -718,9 +719,32 @@ bool cpu_supported() {
 // (/DELAYLOAD), иначе без неё exe вообще не запустится и вместо понятного hello клиент
 // получит системную ошибку загрузчика. Грузим строго из System32: копия рядом с exe
 // или в текущей папке могла бы подменить загрузчик.
+//
+// Одного наличия библиотеки мало: exe импортирует из неё и функции Vulkan 1.1
+// (vkGetPhysicalDeviceFeatures2), которых нет в загрузчике 1.0 от старого драйвера.
+// Отложенный импорт такой функции при первом вызове бросает SEH-исключение 0xC06D007F,
+// catch(...) под /EHsc его не ловит, и процесс упал бы до hello. Поэтому все отложенные
+// импорты связываем заранее, под __try. Функция без C++-объектов: __try нельзя
+// смешивать с раскруткой деструкторов.
+bool bind_vulkan_imports() {
+    HRESULT hr = E_FAIL;
+    __try {
+        hr = __HrLoadAllImportsForDll("vulkan-1.dll");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hr = E_FAIL;
+    }
+    return SUCCEEDED(hr);
+}
+
 bool load_vulkan_loader() {
     HMODULE h = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    return h != nullptr;
+    if (h == nullptr) return false;
+    // Модуль уже загружен из System32, и помощник отложенной загрузки получит именно его.
+    if (!bind_vulkan_imports()) {
+        fprintf(stderr, "podskazych-vk: vulkan-1.dll без нужных функций (загрузчик Vulkan старше 1.1)\n");
+        return false;
+    }
+    return true;
 }
 
 DWORD WINAPI parent_watch_thread(LPVOID param) {
