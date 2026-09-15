@@ -1294,7 +1294,7 @@ int run(int argc, wchar_t ** argv) {
     if (orig_out == nullptr || orig_out == INVALID_HANDLE_VALUE ||
         !DuplicateHandle(GetCurrentProcess(), orig_out, GetCurrentProcess(), &g_proto_out, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
         fprintf(stderr, "podskazych-vk: нет stdout для протокола\n");
-        return 2;
+        return (int) kExitUsage;
     }
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
@@ -1313,7 +1313,7 @@ int run(int argc, wchar_t ** argv) {
     HANDLE in_handle = GetStdHandle(STD_INPUT_HANDLE);
     if (in_handle == nullptr || in_handle == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "podskazych-vk: нет stdin\n");
-        return 2;
+        return (int) kExitUsage;
     }
 
     // --- аргументы: только --parent-pid ---
@@ -1323,14 +1323,14 @@ int run(int argc, wchar_t ** argv) {
             unsigned long pid = wcstoul(argv[++i], &end, 10);
             if (!end || *end != L'\0' || pid == 0) {
                 fprintf(stderr, "podskazych-vk: неверный --parent-pid\n");
-                return 2;
+                return (int) kExitUsage;
             }
             if (!start_parent_watch((DWORD) pid)) {
                 hard_exit(kExitParentGone);
             }
         } else {
             fprintf(stderr, "podskazych-vk: неизвестный аргумент (допускается только --parent-pid <pid>)\n");
-            return 2;
+            return (int) kExitUsage;
         }
     }
 
@@ -1439,15 +1439,15 @@ int run(int argc, wchar_t ** argv) {
 }  // namespace
 
 int wmain(int argc, wchar_t ** argv) {
-    int code = 0;
+    int code = (int) kExitOk;
     try {
         code = run(argc, argv);
     } catch (const std::exception & e) {
         fprintf(stderr, "podskazych-vk: необработанное исключение: %s\n", e.what());
-        code = 1;
+        code = (int) kExitException;
     } catch (...) {
         fprintf(stderr, "podskazych-vk: необработанное исключение\n");
-        code = 1;
+        code = (int) kExitException;
     }
     hard_exit((UINT) code);
 }
