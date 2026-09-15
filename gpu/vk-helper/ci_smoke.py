@@ -80,17 +80,29 @@ def expect_error(h, code=None, id_=None, timeout=60):
     return msg
 
 
-def wait_pid_exit(pid, timeout_s):
-    SYNCHRONIZE = 0x00100000
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.OpenProcess.restype = ctypes.c_void_p
-    h = k32.OpenProcess(SYNCHRONIZE, False, pid)
-    if not h:
-        return True  # уже нет
-    try:
-        return k32.WaitForSingleObject(ctypes.c_void_p(h), int(timeout_s * 1000)) == 0
-    finally:
-        k32.CloseHandle(ctypes.c_void_p(h))
+class ProcHandle:
+    """Дескриптор процесса по PID, открытый заранее: после выхода по нему читается код
+    завершения, и переиспользованный PID не спутается с помощником."""
+
+    def __init__(self, pid):
+        self.k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.k32.OpenProcess.restype = ctypes.c_void_p
+        # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        self.h = self.k32.OpenProcess(0x00100000 | 0x1000, False, pid)
+        if not self.h:
+            raise OSError(f"OpenProcess({pid}): ошибка {ctypes.get_last_error()}")
+
+    def wait(self, timeout_s):
+        return self.k32.WaitForSingleObject(ctypes.c_void_p(self.h), int(timeout_s * 1000)) == 0
+
+    def exit_code(self):
+        code = ctypes.c_ulong()
+        if not self.k32.GetExitCodeProcess(ctypes.c_void_p(self.h), ctypes.byref(code)):
+            return None
+        return None if code.value == 259 else code.value  # STILL_ACTIVE
+
+    def close(self):
+        self.k32.CloseHandle(ctypes.c_void_p(self.h))
 
 
 def main():
@@ -197,14 +209,32 @@ def main():
     parent = subprocess.Popen([sys.executable, "-c", launcher, exe, str(rh)], stdout=subprocess.PIPE, close_fds=False)
     os.close(r)
     helper_pid = int(parent.stdout.readline().strip())
-    time.sleep(0.5)
+    ph = ProcHandle(helper_pid)
+    check(not ph.wait(0.5), "помощник жив, пока жив родитель")
     t_kill = time.monotonic()
     parent.kill()  # TerminateProcess, как у Electron
     parent.wait()
-    exited = wait_pid_exit(helper_pid, 10)
+    exited = ph.wait(10)
     dt = time.monotonic() - t_kill
+    code = ph.exit_code()
+    ph.close()
     check(exited and dt < 5, f"помощник вышел после смерти родителя ({dt:.2f} с)")
+    check(code == 5, f"код выхода после смерти родителя 5 (получен {code})")
     os.close(w)
+
+    # --- PID родителя, которого уже нет: сразу код 5 ---
+    # stdin — труба, которую держим открытой: выйти по EOF с кодом 0 помощник не может.
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    q = subprocess.Popen([exe, "--parent-pid", str(gone.pid)], stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        code = q.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        q.kill()
+        code = None
+    q.stdin.close()
+    check(code == 5, f"завершившийся родитель -> код 5 (получен {code})")
 
     print("stderr помощника (хвост):")
     print(h.stderr.decode("utf-8", "replace")[-3000:])

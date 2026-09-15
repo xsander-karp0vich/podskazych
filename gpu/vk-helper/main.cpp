@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,6 +59,16 @@ constexpr size_t kMaxPromptTokens = 223;
 // Завершение процесса
 // ---------------------------------------------------------------------------
 
+// Коды выхода (описаны в README.md). 3 помощник не использует: так UCRT завершает abort(),
+// если обработчик SIGABRT почему-то не сработал.
+constexpr UINT kExitOk = 0;
+constexpr UINT kExitException = 1;
+constexpr UINT kExitUsage = 2;
+constexpr UINT kExitStdoutClosed = 4;
+constexpr UINT kExitParentGone = 5;
+constexpr UINT kExitDesync = 6;
+constexpr UINT kExitFatal = 7;
+
 // Выходим через TerminateProcess, а не через return/exit: статические объекты
 // ggml-vulkan разрушаются уже после выгрузки драйвера, и на части драйверов Windows это
 // зависание или падение на выходе. Всё нужное (ответы) к этому моменту уже записано
@@ -66,6 +77,32 @@ constexpr size_t kMaxPromptTokens = 223;
     fflush(stderr);
     TerminateProcess(GetCurrentProcess(), code);
     ExitProcess(code);  // на случай, если TerminateProcess почему-то вернулся
+}
+
+// Аварийный путь: пишем прямо в дескриптор stderr, минуя CRT (его блокировку может
+// держать поток, на котором всё и сломалось), и сразу завершаемся.
+void raw_stderr(const char * s) {
+    HANDLE e = GetStdHandle(STD_ERROR_HANDLE);
+    if (!s || e == nullptr || e == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(e, s, (DWORD) strlen(s), &written, nullptr);
+}
+
+// GGML_ABORT и GGML_ASSERT (в том числе внутри ggml-vulkan после сбоя драйвера).
+// Без обработчика ggml зовёт abort(), и код выхода не отличался бы от других падений.
+void ggml_fatal(const char * message) {
+    raw_stderr("podskazych-vk: аварийная остановка ggml: ");
+    raw_stderr(message);
+    raw_stderr("\n");
+    TerminateProcess(GetCurrentProcess(), kExitFatal);
+    ExitProcess(kExitFatal);
+}
+
+// abort() и std::terminate (исключение из деструктора, noexcept и т. п.).
+void on_sigabrt(int) {
+    raw_stderr("podskazych-vk: abort()\n");
+    TerminateProcess(GetCurrentProcess(), kExitFatal);
+    ExitProcess(kExitFatal);
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +125,7 @@ void proto_write_line(const std::string & line) {
         if (!WriteFile(g_proto_out, p, chunk, &written, nullptr) || written == 0) {
             // Клиент закрыл свой конец трубы — отвечать больше некому.
             fprintf(stderr, "podskazych-vk: stdout закрыт (ошибка %lu), выходим\n", GetLastError());
-            hard_exit(4);
+            hard_exit(kExitStdoutClosed);
         }
         p += written;
         left -= written;
@@ -626,7 +663,7 @@ DWORD WINAPI parent_watch_thread(LPVOID param) {
     HANDLE h = (HANDLE) param;
     WaitForSingleObject(h, INFINITE);
     fprintf(stderr, "podskazych-vk: родительский процесс завершился, выходим\n");
-    hard_exit(3);
+    hard_exit(kExitParentGone);
 }
 
 // Electron останавливает python.exe через TerminateProcess, atexit в Python не
@@ -1115,6 +1152,10 @@ int run(int argc, wchar_t ** argv) {
     // процесс без окна, упавший помощник должен просто завершиться.
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    // Аварийные остановки получают свой код выхода (kExitFatal), чтобы сайдкар отличал
+    // сбой видеокарты от смерти родителя и от рассинхронизации протокола.
+    signal(SIGABRT, on_sigabrt);
+    ggml_set_abort_callback(ggml_fatal);
     // Текущая папка не участвует в поиске DLL.
     SetDllDirectoryW(L"");
 
@@ -1155,7 +1196,7 @@ int run(int argc, wchar_t ** argv) {
                 return 2;
             }
             if (!start_parent_watch((DWORD) pid)) {
-                hard_exit(3);
+                hard_exit(kExitParentGone);
             }
         } else {
             fprintf(stderr, "podskazych-vk: неизвестный аргумент (допускается только --parent-pid <pid>)\n");
