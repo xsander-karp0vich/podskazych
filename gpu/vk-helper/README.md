@@ -1,0 +1,169 @@
+# podskazych-vk — распознавание на видеокарте через Vulkan
+
+Отдельный процесс для сайдкара: whisper.cpp v1.9.4 с бэкендом ggml-vulkan одним exe.
+Нужен для видеокарт AMD и Intel (дискретных и встроенных), где путь CTranslate2/CUDA
+не работает. Модель — ggml-файл whisper.cpp (например, `ggml-large-v3-turbo-q8_0.bin`).
+
+Почему так, коротко:
+
+- **Отдельный процесс.** Сбой драйвера (TDR, потеря устройства, abort в ggml) убивает
+  только помощника; сайдкар видит закрытую трубу и уходит на процессор.
+- **stdin/stdout, а не whisper-server.** У сервера `Access-Control-Allow-Origin: *` и
+  `/load` без токена, который при ошибке делает `exit(1)`: любая страница в браузере
+  могла бы остановить распознавание посреди созвона.
+- **Всё по трубе в UTF-8.** argv на Windows приходит в кодировке ANSI (cp1251):
+  кириллический путь к модели в командной строке роняет whisper.cpp, подсказка
+  искажается. В командной строке только ASCII-флаг `--parent-pid`.
+- **Токены подсказки, а не текст.** Токенизатор whisper.cpp режет слова не так, как
+  HF BPE, и при переполнении отбрасывает начало подсказки. Сайдкар уже считает токены
+  HF-токенизатором и присылает готовые номера.
+
+## Запуск
+
+```
+podskazych-vk.exe [--parent-pid <pid>]
+```
+
+`--parent-pid` — PID процесса, после смерти которого помощник завершается сам
+(Electron останавливает python.exe через TerminateProcess, и atexit в Python не
+срабатывает). Других аргументов нет; неизвестный аргумент — код выхода 2.
+
+stdin и stdout — двоичный протокол ниже. **stderr — только логи whisper/ggml, и его
+обязательно вычитывать**: если труба stderr заполнится, помощник остановится на записи
+лога.
+
+Коды выхода: 0 — `quit` или конец stdin; 2 — неверные аргументы или нет stdin/stdout;
+3 — родитель завершился; 4 — клиент закрыл stdout; другое — аварийное завершение
+(например, abort внутри ggml при сбое драйвера).
+
+## Протокол
+
+Каждое сообщение — одна строка JSON в UTF-8, завершённая `\n` (строка до 64 КБ).
+Ответы помощника идут строго по одному на запрос, в том же порядке. Поля сверх
+перечисленных клиент должен игнорировать.
+
+### 1. hello (сразу после запуска)
+
+```json
+{"type":"hello","version":"1.9.4","protocol":1,
+ "devices":[{"index":0,"name":"AMD Radeon RX 5700 XT","type":"discrete","vramMB":8176,"freeMB":7900}],
+ "cpuOk":true,"vulkanLoader":true}
+```
+
+- `devices` — только устройства Vulkan типа GPU/IGPU из реестра ggml. `index` — тот же
+  счёт, что `gpu_device` в whisper.cpp. `type`: `discrete`, `integrated` или `other`
+  (Vulkan поверх Direct3D 12 и подобные прослойки; сами их не выбираем).
+- `vramMB` для встроенной графики — доступная ей общая память.
+- `cpuOk: false` — процессор без AVX2/FMA/F16C/BMI2, эта сборка на нём работать не будет.
+- `vulkanLoader: false` — в System32 нет `vulkan-1.dll` (драйвер без Vulkan).
+- Перечисление устройств может занять до пары секунд.
+
+### 2. load
+
+```json
+{"type":"load","model":"C:\\Users\\Иван\\AppData\\Local\\...\\ggml-large-v3-turbo-q8_0.bin",
+ "device":-1,"flashAttn":true,"threads":2}
+```
+
+- `model` — абсолютный путь в UTF-8, файл открывается через `_wfopen`.
+- `device` — индекс из hello или `-1`: сначала дискретная, потом встроенная.
+- `flashAttn` — на фирменном драйвере AMD для RDNA1/2 у flash attention отдельный путь
+  шейдеров с известными ошибками; при мусоре в тексте перезагружать с `false`.
+- `threads` — потоки процессорной части (1..64, по умолчанию 2).
+
+Повторный `load` освобождает прежнюю модель. Ответ:
+
+```json
+{"type":"loaded","device":0,"name":"AMD Radeon RX 5700 XT","deviceType":"discrete","flashAttn":true,"ms":2300}
+```
+
+или `{"type":"error","code":"bad-model"|"no-device"|"load-failed","message":"…"}`:
+`bad-model` — файл не открылся или нет сигнатуры ggml; `no-device` — нет Vulkan или
+подходящего устройства; `load-failed` — whisper не загрузил модель или видеокарта не
+инициализировалась (помощник не даёт whisper.cpp молча перейти на процессор).
+
+Первое распознавание после загрузки компилирует конвейеры Vulkan и идёт заметно дольше —
+для этого прогрев у сайдкара.
+
+### 3. transcribe
+
+Строка-заголовок и **сразу за ней** ровно `samples × 4` байт: float32 little-endian,
+16 кГц, моно.
+
+```json
+{"type":"transcribe","id":17,"samples":80000,"language":"ru","audioCtx":0,
+ "promptTokens":[3919,1531,22860],"maxTokens":0}
+```
+
+- `samples` — не больше 960000 (60 с). Больше — ошибка, но байты всё равно вычитываются.
+- `promptTokens` — номера токенов HF-токенизатора, не больше 223 (окно 224 минус
+  `<|startofprev|>`). Помощник сам добавляет служебные токены; `<|startofprev|>` в
+  список не включать. Как в faster-whisper, текст подсказки кодируется с ведущим
+  пробелом и без служебных токенов: `tokenizer.encode(" " + prompt,
+  add_special_tokens=False)`. Номер вне словаря — ошибка.
+- `language` — код языка whisper (`ru`) или `auto`.
+- `audioCtx` — 0 (полное окно 30 с) или меньше (1500 = 30 с). Короткое окно быстрее,
+  но теряет термины.
+- `maxTokens` — ограничение токенов на сегмент, 0 — без ограничения.
+
+Параметры, которые помощник ставит всегда: greedy, `temperature=0` без повторов
+с повышением (`temperature_inc=0`), `no_context`, `no_timestamps`, `suppress_blank`,
+`suppress_nst` (как `suppress_tokens=[-1]` в faster-whisper), без встроенного VAD.
+
+Ответ:
+
+```json
+{"type":"result","id":17,"text":" Разговор про СКД.","ms":412,
+ "encodeMs":180.2,"decodeMs":6.1,"batchdMs":0.0,"promptMs":35.0,"sampleMs":0.4}
+```
+
+`ms` — полное время `whisper_full`; остальное — из `whisper_get_timings`, это средние
+на один прогон (кодировщик обычно один на фразу, `decodeMs` — на шаг декодера).
+Битые последовательности UTF-8 в тексте заменяются на U+FFFD.
+
+Ошибка: `{"type":"error","id":17,"message":"…"}`. После исключения из ggml-vulkan
+(обычно потеря устройства) модель считается потерянной, следующий `transcribe` вернёт
+ошибку до нового `load`.
+
+### 4. quit
+
+`{"type":"quit"}` — освободить модель и выйти с кодом 0. Конец stdin — то же самое.
+
+### Неверный ввод
+
+Строка не JSON, неизвестный `type`, строка длиннее 64 КБ —
+`{"type":"error","code":"bad-json","message":"…"}`, помощник продолжает работу. Если в
+`transcribe` нет корректного `samples`, помощник не знает, сколько байт звука пропустить,
+и поток дальше рассинхронизирован — клиенту в этом случае надо перезапустить процесс.
+
+## Сборка
+
+Собирается в GitHub Actions: `.github/workflows/gpu-vulkan.yml` (ветка
+`gpu-vulkan-build` или ручной запуск). Руками то же самое:
+
+1. Visual Studio 2022 с C++, CMake 3.21+, Ninja (идут с VS).
+2. LunarG Vulkan SDK 1.4.357.0 (нужны glslc и SPIRV-Headers; SDK старше 1.3.29x не
+   подходят), переменная `VULKAN_SDK`.
+3. whisper.cpp на коммите тега v1.9.4 `927cfce34f31707e17f2bff35c349632fb9e2c3a`.
+4. В «x64 Native Tools Command Prompt»:
+
+```
+cmake -S gpu/vk-helper -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DWHISPER_CPP_DIR=C:/src/whisper.cpp
+cmake --build build
+```
+
+Что задаёт `CMakeLists.txt` и зачем:
+
+- `BUILD_SHARED_LIBS=OFF`, `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` — один exe без
+  VC++ redist (для папок whisper.cpp дополнительно `CMP0091=NEW`, иначе его библиотека
+  собралась бы с `/MD`);
+- `GGML_OPENMP=OFF` — иначе нужна `vcomp140.dll`;
+- `GGML_NATIVE=OFF` и явно AVX2/FMA/F16C/BMI2 — сборка на раннере, запуск у людей;
+  main.cpp проверяет этот набор до первого вызова ggml;
+- `/DELAYLOAD:vulkan-1.dll` — без драйвера Vulkan exe всё равно запускается и отвечает
+  hello с `vulkanLoader:false`; сама библиотека грузится только из System32.
+
+Проверка на раннере без видеокарты — `ci_smoke.py`: hello, мусор во входе, вычитывание
+звука при отказе, кириллические пути, quit, конец stdin, смерть родителя. Таблица
+импорта exe проверяется отдельно (`dumpbin /dependents`): на раннере VC++ redist
+установлен, и сам запуск этого не доказывает.

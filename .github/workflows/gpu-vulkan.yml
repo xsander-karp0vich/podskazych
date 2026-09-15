@@ -1,0 +1,160 @@
+# GPU-пакет распознавания для AMD и Intel: podskazych-vk.exe — whisper.cpp с бэкендом
+# Vulkan одним exe (исходники помощника в gpu/vk-helper).
+#
+# Официальных сборок whisper.cpp под Windows с Vulkan нет (issue #3673 закрыт как
+# not planned), поэтому собираем сами: код whisper.cpp берётся на закреплённом коммите
+# тега, Vulkan SDK — официальный установщик LunarG со сверкой SHA-256.
+#
+# На этом этапе только артефакт сборки (14 дней). Релизов и тегов workflow не создаёт:
+# права только на чтение.
+
+name: gpu-vulkan
+
+on:
+  push:
+    branches: [gpu-vulkan-build]
+    paths:
+      - 'gpu/**'
+      - '.github/workflows/gpu-vulkan.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-vulkan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WHISPER_CPP_TAG: 'v1.9.4'
+  # Коммит, на который указывает тег (объект тега 7d75b149…). Тег можно перевесить,
+  # коммит — нет; ниже сборка проверяет, что тег по-прежнему указывает сюда.
+  WHISPER_CPP_COMMIT: '927cfce34f31707e17f2bff35c349632fb9e2c3a'
+  # 1.4.357.0 — та же версия, что в release.yml llama.cpp. SDK старше 1.3.29x не
+  # содержат SPIRV-HeadersConfig.cmake, который требует ggml-vulkan.
+  VULKAN_SDK_VERSION: '1.4.357.0'
+  # Хэш из опубликованного LunarG списка файлов (vulkan.lunarg.com/sdk/files.json).
+  VULKAN_SDK_SHA256: '81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d'
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Исходники whisper.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ env.WHISPER_CPP_COMMIT }}
+          path: third_party/whisper.cpp
+          persist-credentials: false
+
+      - name: Сверка тега whisper.cpp
+        shell: pwsh
+        working-directory: third_party/whisper.cpp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = git rev-parse HEAD
+          if ($head -ne $env:WHISPER_CPP_COMMIT) { throw "HEAD $head, ожидался $env:WHISPER_CPP_COMMIT" }
+          git fetch --depth=1 --no-tags origin "refs/tags/$($env:WHISPER_CPP_TAG):refs/tags/$($env:WHISPER_CPP_TAG)"
+          if ($LASTEXITCODE) { throw 'Не получен тег whisper.cpp' }
+          $tagged = git rev-parse "$($env:WHISPER_CPP_TAG)^{commit}"
+          if ($tagged -ne $env:WHISPER_CPP_COMMIT) { throw "Тег $env:WHISPER_CPP_TAG указывает на $tagged, а закреплён $env:WHISPER_CPP_COMMIT" }
+          "whisper.cpp $env:WHISPER_CPP_TAG = $tagged"
+
+      # Своим шагом, без сторонних action: установщик официальный, хэш закреплён выше,
+      # и в логе видно, что именно установлено.
+      - name: Vulkan SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:VULKAN_SDK_VERSION
+          $exe = Join-Path $env:RUNNER_TEMP "vulkansdk-windows-X64-$v.exe"
+          curl.exe -sS -L --fail --retry 5 --retry-delay 10 -o $exe "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe"
+          if ($LASTEXITCODE) { throw 'Не скачался установщик Vulkan SDK' }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          '{0:N0} байт, sha256 {1}' -f (Get-Item $exe).Length, $hash
+          if ($hash -ne $env:VULKAN_SDK_SHA256) { throw "SHA-256 установщика $hash не совпадает с закреплённым $env:VULKAN_SDK_SHA256" }
+          $p = Start-Process -FilePath $exe -ArgumentList '--accept-licenses', '--default-answer', '--confirm-command', 'install' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "Установщик Vulkan SDK завершился с кодом $($p.ExitCode)" }
+          $sdk = "C:\VulkanSDK\$v"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { throw "Нет $sdk\Bin\glslc.exe" }
+          $spirv = Get-ChildItem $sdk -Recurse -Filter 'SPIRV-HeadersConfig.cmake' | Select-Object -First 1
+          if (-not $spirv) { throw 'В SDK нет SPIRV-HeadersConfig.cmake' }
+          & "$sdk\Bin\glslc.exe" --version
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Сборка
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          where cmake || exit /b 1
+          where ninja || exit /b 1
+          cmake --version
+          cmake -S gpu/vk-helper -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DWHISPER_CPP_DIR=%GITHUB_WORKSPACE%/third_party/whisper.cpp" || exit /b 1
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          dumpbin /nologo /dependents build\podskazych-vk.exe > build\dependents.txt || exit /b 1
+          type build\dependents.txt
+
+      # Раннер — не чистая машина: VC++ redist там стоит, и запуск exe сам по себе не
+      # докажет, что библиотеки не нужны. Поэтому смотрим таблицу импорта.
+      - name: Зависимости exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $text = Get-Content build/dependents.txt -Raw
+          foreach ($bad in 'MSVCP140', 'VCRUNTIME140', 'VCOMP140', 'api-ms-win-crt', 'ucrtbase', 'libomp') {
+            if ($text -match [regex]::Escape($bad)) { throw "exe зависит от $bad — пользователю понадобился бы VC++ redist" }
+          }
+          $parts = $text -split 'delay load dependencies'
+          if ($parts.Count -lt 2 -or $parts[1] -notmatch 'vulkan-1\.dll') { throw 'vulkan-1.dll должна быть в отложенных зависимостях' }
+          if ($parts[0] -match 'vulkan-1\.dll') { throw 'vulkan-1.dll в обычных зависимостях: без драйвера exe не запустится' }
+          'Импорты в порядке'
+
+      - name: Проверка без видеокарты
+        shell: pwsh
+        run: |
+          python gpu/vk-helper/ci_smoke.py build/podskazych-vk.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Пакет
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = Join-Path $env:RUNNER_TEMP 'podskazych-vk-win-x64'
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item build/podskazych-vk.exe $pkg
+          Copy-Item gpu/vk-helper/README.md (Join-Path $pkg 'README.md')
+          Copy-Item gpu/vk-helper/THIRD-PARTY-NOTICES.txt $pkg
+          # ggml входит в дерево whisper.cpp и распространяется под его же лицензией MIT
+          Copy-Item third_party/whisper.cpp/LICENSE (Join-Path $pkg 'LICENSE-whisper.cpp.txt')
+          Copy-Item third_party/whisper.cpp/LICENSE (Join-Path $pkg 'LICENSE-ggml.txt')
+          Copy-Item LICENSE (Join-Path $pkg 'LICENSE-podskazych.txt')
+          $sums = Get-ChildItem $pkg -File | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          }
+          # LF и без BOM: так файл читает и sha256sum -c
+          [IO.File]::WriteAllText((Join-Path $pkg 'SHA256SUMS.txt'), (($sums -join "`n") + "`n"))
+          Get-Content (Join-Path $pkg 'SHA256SUMS.txt')
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zip = Join-Path $PWD 'dist/podskazych-vk-win-x64.zip'
+          Compress-Archive -Path (Join-Path $pkg '*') -DestinationPath $zip -CompressionLevel Optimal
+          $len = (Get-Item $zip).Length
+          '{0:N1} МБ' -f ($len / 1MB)
+          if ($len -gt 80MB) { throw 'Пакет больше 80 МБ — что-то лишнее попало в сборку' }
+          $zh = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $PWD 'dist/podskazych-vk-win-x64.zip.sha256'), "$zh  podskazych-vk-win-x64.zip`n")
+          "zip sha256 $zh"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: podskazych-vk-win-x64
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
