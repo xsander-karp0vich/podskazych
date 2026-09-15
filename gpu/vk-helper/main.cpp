@@ -54,6 +54,10 @@ constexpr int64_t kMaxSamples = 30 * 16000 * 2;
 // Если отдать больше, whisper.cpp молча отрежет НАЧАЛО, а там у нас самые важные
 // термины, поэтому лишнее отклоняем явно.
 constexpr size_t kMaxPromptTokens = 223;
+// Меньше 100 мс whisper не распознаёт (whisper_full_with_state выходит без сегментов),
+// а при samples = 0 он ещё и не пересчитывает мел (src/whisper.cpp: n_samples > 0) и
+// заново распознаёт звук прошлого вызова. Такие фрагменты до whisper_full не доходят.
+constexpr size_t kMinSamples = 1600;
 
 // ---------------------------------------------------------------------------
 // Завершение процесса
@@ -1064,6 +1068,12 @@ bool handle_transcribe(const JsonObject & msg, Input & in) {
     }
     if (language.empty() || (language != "auto" && whisper_lang_id(language.c_str()) < 0)) {
         send_error(nullptr, "неизвестный язык: " + language, has_id, id);
+        return true;
+    }
+    if (pcm.size() < kMinSamples) {
+        JsonWriter w;
+        w.str("type", "result").num("id", id).str("text", "").num("ms", 0);
+        proto_write_line(w.done());
         return true;
     }
 
